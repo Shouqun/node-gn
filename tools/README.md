@@ -1,6 +1,6 @@
 Tools
 ==================
-### Essetial tools for node-gn.
+### Essential tools for node-gn.
 
 ##### Install depot_tools
 depot_tools contains essential script and the Ninja binaries for all platforms.
