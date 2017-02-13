@@ -41,7 +41,7 @@ def main():
   platform_arg = '--platform=%s' % (PLATFORM_MAP[platform])
   sha_arg = 'gn/%s/%s.sha1' % (PLATFORM_DIR_MAP[platform], BINARY_MAP[platform])
   sha_arg = os.path.join(SCRIPT_DIR, sha_arg)
-  command_line = ['download_from_google_storage', '--no_resume',
+  command_line = ['download_from_google_storage.py', '--no_resume',
       platform_arg, '--no_auth', '--bucket', 'chromium-gn',
       '-s', sha_arg]
 
