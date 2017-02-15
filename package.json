@@ -10,6 +10,7 @@
 	"ninja"
   ],
   "bin": "./bin/node-gn.js",
+  "main": "./lib/node-gn.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
