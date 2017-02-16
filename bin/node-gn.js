@@ -9,4 +9,5 @@ var argv = process.argv;
 
 gn_module = gn();
 
-console.log('Run gn: ' + gn_module.run_gn());
+console.log('Run gn: ')
+gn_module.run_gn(process.argv);
