@@ -1,0 +1,15 @@
+if (target_os == "") {
+  target_os = host_os
+}
+
+if (target_cpu == "") {
+  target_cpu = host_cpu
+}
+
+
+declare_args() {
+  host_toolchain = ""
+}
+
+
+set_default_toolchain("//buildconfig/toolchain/$host_os")
