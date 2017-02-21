@@ -5,6 +5,8 @@ toolchain("linux") {
   cxx = "g++"
   ar = "ar"
   ld = cxx
+  readelf = "readelf"
+  nm = "nm"
 
   tool("cc") {
     depfile = "{{output}}.d"
@@ -45,10 +47,26 @@ toolchain("linux") {
   }
 
   tool("solink") {
-    outputs = [
-      "{{root_out_dir}}/{{target_output_name}}{{output_extension}}",
-    ]
-    command = "$ld {{ldflags}} -o {{output}} {{inputs}} {{solibs}} {{libs}}"
+    soname = "{{target_output_name}}{{output_extension}}"
+    sofile = "{{root_out_dir}}/$soname"
+    rspfile = sofile + ".rsp"
+    tocfile = sofile + ".TOC"
+
+    link_command = "$ld -shared {{ldflags}} -o \"$sofile\" -Wl,-soname=\"$soname\" @\"$rspfile\""
+    rspfile_content = "-Wl,--whole-archive {{inputs}} {{solibs}} -Wl,--no-whole-archive {{libs}}"
+    solink_wrapper = rebase_path("//buildconfig/toolchain/linux/gcc_solink_wrapper.py")
+    command = "$solink_wrapper --readelf=\"$readelf\" --nm=\"$nm\" --sofile=\"$sofile\" --tocfile=\"$tocfile\" --output=\"$sofile\" -- $link_command"
     description = "LINK {{output}}"
+
+    default_output_extension = ".so"
+    default_output_dir = "{{root_out_dir}}"
+    output_prefix = "lib"
+    restat = true
+    outputs = [
+      sofile,
+      tocfile,
+    ]
+    link_output = sofile
+    depend_output = tocfile
   }
 }
