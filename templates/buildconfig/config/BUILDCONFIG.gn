@@ -12,4 +12,4 @@ declare_args() {
 }
 
 
-set_default_toolchain("//buildconfig/toolchain/$host_os")
+set_default_toolchain("//buildconfig/toolchain/$host_os:$host_os")

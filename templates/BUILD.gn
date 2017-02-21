@@ -1,0 +1,2 @@
+shared_library("replace_with_your_module") {
+}

@@ -1,4 +1,4 @@
-toolchain("gcc") {
+toolchain("linux") {
   object_subdir = "{{target_out_dir}}/{{label_name}}"
 
   cc = "gcc"
@@ -37,6 +37,14 @@ toolchain("gcc") {
   }
 
   tool("link") {
+    outputs = [
+      "{{root_out_dir}}/{{target_output_name}}{{output_extension}}",
+    ]
+    command = "$ld {{ldflags}} -o {{output}} {{inputs}} {{solibs}} {{libs}}"
+    description = "LINK {{output}}"
+  }
+
+  tool("solink") {
     outputs = [
       "{{root_out_dir}}/{{target_output_name}}{{output_extension}}",
     ]
