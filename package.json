@@ -1,5 +1,5 @@
 {
-  "name": "node-gn",
+  "name": "nodegn",
   "version": "0.1.0",
   "description": "Node.js native addon build tool with GN.",
   "keywords" :[
