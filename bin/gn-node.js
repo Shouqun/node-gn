@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 var path = require('path');
-var gn = require('../');
+var gn = require('../lib/node-gn.js');
 
-process.title = 'node-gn'
+process.title = 'gn-node'
 
 var argv = process.argv;
 
