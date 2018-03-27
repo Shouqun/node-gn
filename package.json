@@ -2,15 +2,19 @@
   "name": "gn-node",
   "version": "0.1.0",
   "description": "Node.js native addon build tool with GN.",
-  "keywords" :[
+  "keywords": [
     "native",
-	"addon",
-	"build",
-	"GN",
-	"ninja"
+    "addon",
+    "build",
+    "GN",
+    "ninja"
   ],
   "bin": "./bin/node-gn.js",
   "main": "./lib/node-gn.js",
+  "repository": {
+	  "type": "git",
+	  "url": "https://github.com/Shouqun/node-gn.git"
+  },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
