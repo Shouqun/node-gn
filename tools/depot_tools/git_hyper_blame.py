@@ -94,6 +94,11 @@ def parse_blame(blameoutput):
     yield BlameLine(commit, context, lineno_then, lineno_now, False)
 
 
+def num_codepoints(s):
+  """Gets the length of a UTF-8 byte string, in Unicode codepoints."""
+  return len(s.decode('utf-8', errors='replace'))
+
+
 def print_table(table, colsep=' ', rowsep='\n', align=None, out=sys.stdout):
   """Print a 2D rectangular array, aligning columns with spaces.
 
@@ -107,9 +112,10 @@ def print_table(table, colsep=' ', rowsep='\n', align=None, out=sys.stdout):
   colwidths = None
   for row in table:
     if colwidths is None:
-      colwidths = [len(x) for x in row]
+      colwidths = [num_codepoints(x) for x in row]
     else:
-      colwidths = [max(colwidths[i], len(x)) for i, x in enumerate(row)]
+      colwidths = [max(colwidths[i], num_codepoints(x))
+                   for i, x in enumerate(row)]
 
   if align is None:  # pragma: no cover
     align = 'l' * len(colwidths)
@@ -117,7 +123,7 @@ def print_table(table, colsep=' ', rowsep='\n', align=None, out=sys.stdout):
   for row in table:
     cells = []
     for i, cell in enumerate(row):
-      padding = ' ' * (colwidths[i] - len(cell))
+      padding = ' ' * (colwidths[i] - num_codepoints(cell))
       if align[i] == 'r':
         cell = padding + cell
       elif i < len(row) - 1:
@@ -312,9 +318,9 @@ def hyper_blame(ignored, filename, revision='HEAD', out=sys.stdout,
       newline = parent_blame[lineno_previous - 1]
 
       # Replace the commit and lineno_then, but not the lineno_now or context.
-      logging.debug('    replacing with %r', newline)
-      line = BlameLine(newline.commit, line.context, lineno_previous,
+      line = BlameLine(newline.commit, line.context, newline.lineno_then,
                        line.lineno_now, True)
+      logging.debug('    replacing with %r', line)
 
     # If any line has a different filename to the file's current name, turn on
     # filename display for the entire blame output.
@@ -345,6 +351,7 @@ def main(args, stdout=sys.stdout, stderr=sys.stderr):
                       type=argparse.FileType('r'), dest='ignore_file',
                       help='a file containing a list of revisions to ignore')
   parser.add_argument('--no-default-ignores', dest='no_default_ignores',
+                      action='store_true',
                       help='Do not ignore commits from .git-blame-ignore-revs.')
   parser.add_argument('revision', nargs='?', default='HEAD', metavar='REVISION',
                       help='revision to look at')

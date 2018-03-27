@@ -8,6 +8,7 @@ import cStringIO
 import glob
 import logging
 import os
+import platform
 import re
 import sys
 import tempfile
@@ -130,8 +131,8 @@ class GIT(object):
       upstream_branch = GIT.GetUpstreamBranch(cwd)
       if upstream_branch is None:
         raise gclient_utils.Error('Cannot determine upstream branch')
-    command = ['diff', '--name-status', '--no-renames',
-               '-r', '%s...' % upstream_branch]
+    command = ['-c', 'core.quotePath=false', 'diff',
+               '--name-status', '--no-renames', '-r', '%s...' % upstream_branch]
     if not files:
       pass
     elif isinstance(files, basestring):
@@ -255,6 +256,19 @@ class GIT(object):
     return upstream_branch
 
   @staticmethod
+  def GetOldContents(cwd, filename, branch=None):
+    if not branch:
+      branch = GIT.GetUpstreamBranch(cwd)
+    if platform.system() == 'Windows':
+      # git show <sha>:<path> wants a posix path.
+      filename = filename.replace('\\', '/')
+    command = ['show', '%s:%s' % (branch, filename)]
+    try:
+      return GIT.Capture(command, cwd=cwd, strip_out=False)
+    except subprocess2.CalledProcessError:
+      return ''
+
+  @staticmethod
   def GenerateDiff(cwd, branch=None, branch_head='HEAD', full_move=False,
                    files=None):
     """Diffs against the upstream branch or optionally another branch.
@@ -263,7 +277,8 @@ class GIT(object):
     files, usually in the prospect to apply the patch for a try job."""
     if not branch:
       branch = GIT.GetUpstreamBranch(cwd)
-    command = ['diff', '-p', '--no-color', '--no-prefix', '--no-ext-diff',
+    command = ['-c', 'core.quotePath=false', 'diff',
+               '-p', '--no-color', '--no-prefix', '--no-ext-diff',
                branch + "..." + branch_head]
     if full_move:
       command.append('--no-renames')
@@ -286,7 +301,8 @@ class GIT(object):
     """Returns the list of modified files between two branches."""
     if not branch:
       branch = GIT.GetUpstreamBranch(cwd)
-    command = ['diff', '--name-only', branch + "..." + branch_head]
+    command = ['-c', 'core.quotePath=false', 'diff',
+               '--name-only', branch + "..." + branch_head]
     return GIT.Capture(command, cwd=cwd).splitlines(False)
 
   @staticmethod

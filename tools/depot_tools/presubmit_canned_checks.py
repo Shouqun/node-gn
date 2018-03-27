@@ -39,39 +39,13 @@ BLACKLIST_LINT_FILTERS = [
 
 ### Description checks
 
-def CheckChangeHasTestField(input_api, output_api):
-  """Requires that the changelist have a TEST= field."""
-  if input_api.change.TEST:
-    return []
-  else:
-    return [output_api.PresubmitNotifyResult(
-        'If this change requires manual test instructions to QA team, add '
-        'TEST=[instructions].')]
-
-
 def CheckChangeHasBugField(input_api, output_api):
-  """Requires that the changelist have a BUG= field."""
-  if input_api.change.BUG:
+  """Requires that the changelist have a Bug: field."""
+  if input_api.change.BugsFromDescription():
     return []
   else:
     return [output_api.PresubmitNotifyResult(
-        'If this change has an associated bug, add BUG=[bug number].')]
-
-
-def CheckChangeHasTestedField(input_api, output_api):
-  """Requires that the changelist have a TESTED= field."""
-  if input_api.change.TESTED:
-    return []
-  else:
-    return [output_api.PresubmitError('Changelist must have a TESTED= field.')]
-
-
-def CheckChangeHasQaField(input_api, output_api):
-  """Requires that the changelist have a QA= field."""
-  if input_api.change.QA:
-    return []
-  else:
-    return [output_api.PresubmitError('Changelist must have a QA= field.')]
+        'If this change has an associated bug, add Bug: [bug number].')]
 
 
 def CheckDoNotSubmitInDescription(input_api, output_api):
@@ -110,6 +84,11 @@ def CheckAuthorizedAuthor(input_api, output_api):
   """For non-googler/chromites committers, verify the author's email address is
   in AUTHORS.
   """
+  if input_api.is_committing:
+    error_type = output_api.PresubmitError
+  else:
+    error_type = output_api.PresubmitPromptWarning
+
   author = input_api.change.author_email
   if not author:
     input_api.logging.info('No author, skipping AUTHOR check')
@@ -123,10 +102,10 @@ def CheckAuthorizedAuthor(input_api, output_api):
   if not any(input_api.fnmatch.fnmatch(author.lower(), valid)
              for valid in valid_authors):
     input_api.logging.info('Valid authors are %s', ', '.join(valid_authors))
-    return [output_api.PresubmitPromptWarning(
+    return [error_type(
         ('%s is not in AUTHORS file. If you are a new contributor, please visit'
         '\n'
-        'http://www.chromium.org/developers/contributing-code and read the '
+        'https://www.chromium.org/developers/contributing-code and read the '
         '"Legal" section\n'
         'If you are a chromite, verify the contributor signed the CLA.') %
         author)]
@@ -360,6 +339,8 @@ def CheckLongLines(input_api, output_api, maxlen, source_file_filter=None):
   # superset of CPP_EXCEPTIONS.
   CPP_FILE_EXTS = ('c', 'cc')
   CPP_EXCEPTIONS = ('#define', '#endif', '#if', '#include', '#pragma')
+  HTML_FILE_EXTS = ('html',)
+  HTML_EXCEPTIONS = ('<g ', '<link ', '<path ',)
   JAVA_FILE_EXTS = ('java',)
   JAVA_EXCEPTIONS = ('import ', 'package ')
   JS_FILE_EXTS = ('js',)
@@ -372,6 +353,7 @@ def CheckLongLines(input_api, output_api, maxlen, source_file_filter=None):
 
   LANGUAGE_EXCEPTIONS = [
     (CPP_FILE_EXTS, CPP_EXCEPTIONS),
+    (HTML_FILE_EXTS, HTML_EXCEPTIONS),
     (JAVA_FILE_EXTS, JAVA_EXCEPTIONS),
     (JS_FILE_EXTS, JS_EXCEPTIONS),
     (OBJC_FILE_EXTS, OBJC_EXCEPTIONS),
@@ -380,7 +362,7 @@ def CheckLongLines(input_api, output_api, maxlen, source_file_filter=None):
 
   def no_long_lines(file_extension, line):
     # Check for language specific exceptions.
-    if any(file_extension in exts and line.startswith(exceptions)
+    if any(file_extension in exts and line.lstrip().startswith(exceptions)
            for exts, exceptions in LANGUAGE_EXCEPTIONS):
       return True
 
@@ -522,7 +504,8 @@ def GetUnitTestsInDirectory(
       continue
     unit_tests.append(input_api.os_path.join(directory, filename))
     to_run += 1
-  input_api.logging.debug('Found %d files, running %d' % (found, to_run))
+  input_api.logging.debug('Found %d files, running %d unit tests'
+                          % (found, to_run))
   if not to_run:
     return [
         output_api.PresubmitPromptWarning(
@@ -545,11 +528,7 @@ def GetUnitTests(input_api, output_api, unit_tests, env=None):
 
   results = []
   for unit_test in unit_tests:
-    cmd = []
-    if input_api.platform == 'win32' and unit_test.endswith('.py'):
-      # Windows needs some help.
-      cmd = [input_api.python_executable]
-    cmd.append(unit_test)
+    cmd = [unit_test]
     if input_api.verbose:
       cmd.append('--verbose')
     kwargs = {'cwd': input_api.PresubmitLocalPath()}
@@ -628,6 +607,7 @@ def GetPythonUnitTests(input_api, output_api, unit_tests):
       if env.get('PYTHONPATH'):
         backpath.append(env.get('PYTHONPATH'))
       env['PYTHONPATH'] = input_api.os_path.pathsep.join((backpath))
+      env.pop('VPYTHON_CLEAR_PYTHONPATH', None)
     cmd = [input_api.python_executable, '-m', '%s' % unit_test]
     results.append(input_api.Command(
         name=unit_test_name,
@@ -672,6 +652,9 @@ def _FetchAllFiles(input_api, white_list, black_list):
   # can break another unmodified file.
   # Use code similar to InputApi.FilterSourceFile()
   def Find(filepath, filters):
+    if input_api.platform == 'win32':
+      filepath = filepath.replace('\\', '/')
+
     for item in filters:
       if input_api.re.match(item, filepath):
         return True
@@ -744,12 +727,11 @@ def GetPylint(input_api, output_api, white_list=None, black_list=None,
 
   input_api.logging.info('Running pylint on %d files', len(files))
   input_api.logging.debug('Running pylint on: %s', files)
-  # Copy the system path to the environment so pylint can find the right
-  # imports.
   env = input_api.environ.copy()
-  import sys
   env['PYTHONPATH'] = input_api.os_path.pathsep.join(
-      extra_paths_list + sys.path).encode('utf8')
+    extra_paths_list).encode('utf8')
+  env.pop('VPYTHON_CLEAR_PYTHONPATH', None)
+  input_api.logging.debug('  with extra PYTHONPATH: %r', extra_paths_list)
 
   def GetPylintCmd(flist, extra, parallel):
     # Windows needs help running python files so we explicitly specify
@@ -866,8 +848,9 @@ def CheckOwners(input_api, output_api, source_file_filter=None):
             'This is a dry run, but these failures would be reported on ' +
             'commit:\n' + text)
     else:
-      return [output_api.PresubmitError("OWNERS check failed: this change has "
-          "no Rietveld issue number, so we can't check it for approvals.")]
+      return [output_api.PresubmitError(
+          'OWNERS check failed: this CL has no Gerrit change number, '
+          'so we can\'t check it for approvals.')]
   else:
     needed = 'OWNER reviewers'
     output_fn = output_api.PresubmitNotifyResult
@@ -876,6 +859,7 @@ def CheckOwners(input_api, output_api, source_file_filter=None):
       input_api.change.AffectedFiles(file_filter=source_file_filter)])
 
   owners_db = input_api.owners_db
+  owners_db.override_files = input_api.change.OriginalOwnersFiles()
   owner_email, reviewers = GetCodereviewOwnerAndReviewers(
       input_api,
       owners_db.email_regexp,
@@ -883,12 +867,12 @@ def CheckOwners(input_api, output_api, source_file_filter=None):
 
   owner_email = owner_email or input_api.change.author_email
 
-  if owner_email:
-    reviewers_plus_owner = set([owner_email]).union(reviewers)
-    missing_files = owners_db.files_not_covered_by(affected_files,
-        reviewers_plus_owner)
-  else:
-    missing_files = owners_db.files_not_covered_by(affected_files, reviewers)
+  finder = input_api.owners_finder(
+      affected_files, input_api.change.RepositoryRoot(),
+      owner_email, reviewers, fopen=file, os_path=input_api.os_path,
+      email_postfix='', disable_color=True,
+      override_files=input_api.change.OriginalOwnersFiles())
+  missing_files = finder.unreviewed_files
 
   if missing_files:
     output_list = [
@@ -896,9 +880,15 @@ def CheckOwners(input_api, output_api, source_file_filter=None):
                   (needed, '\n    '.join(sorted(missing_files))))]
     if not input_api.is_committing:
       suggested_owners = owners_db.reviewers_for(missing_files, owner_email)
+      owners_with_comments = []
+      def RecordComments(text):
+        owners_with_comments.append(finder.print_indent() + text)
+      finder.writeln = RecordComments
+      for owner in suggested_owners:
+        finder.print_comments(owner)
       output_list.append(output_fn('Suggested OWNERS: ' +
           '(Use "git-cl owners" to interactively select owners.)\n    %s' %
-          ('\n    '.join(suggested_owners or []))))
+          ('\n    '.join(owners_with_comments))))
     return output_list
 
   if input_api.is_committing and not reviewers:
@@ -929,10 +919,8 @@ def _GetRietveldIssueProps(input_api, messages):
 def _ReviewersFromChange(change):
   """Return the reviewers specified in the |change|, if any."""
   reviewers = set()
-  if change.R:
-    reviewers.update(set([r.strip() for r in change.R.split(',')]))
-  if change.TBR:
-    reviewers.update(set([r.strip() for r in change.TBR.split(',')]))
+  reviewers.update(change.ReviewersFromDescription())
+  reviewers.update(change.TBRsFromDescription())
 
   # Drop reviewers that aren't specified in email address format.
   return set(reviewer for reviewer in reviewers if '@' in reviewer)
@@ -983,33 +971,6 @@ def _GerritOwnerAndReviewers(input_api, email_regexp, approval_needed=False):
   input_api.logging.debug('owner: %s; approvals given by: %s',
                           owner_email, ', '.join(sorted(reviewers)))
   return owner_email, reviewers
-
-
-def _CheckConstNSObject(input_api, output_api, source_file_filter):
-  """Checks to make sure no objective-c files have |const NSSomeClass*|."""
-  pattern = input_api.re.compile(
-    r'(?<!reinterpret_cast<)'
-    r'const\s+NS(?!(Point|Range|Rect|Size)\s*\*)\w*\s*\*')
-
-  def objective_c_filter(f):
-    return (source_file_filter(f) and
-            input_api.os_path.splitext(f.LocalPath())[1] in ('.h', '.m', '.mm'))
-
-  files = []
-  for f in input_api.AffectedSourceFiles(objective_c_filter):
-    contents = input_api.ReadFile(f)
-    if pattern.search(contents):
-      files.append(f)
-
-  if files:
-    if input_api.is_committing:
-      res_type = output_api.PresubmitPromptWarning
-    else:
-      res_type = output_api.PresubmitNotifyResult
-    return [ res_type('|const NSClass*| is wrong, see ' +
-                      'http://dev.chromium.org/developers/clang-mac',
-                      files) ]
-  return []
 
 
 def CheckSingletonInHeaders(input_api, output_api, source_file_filter=None):
@@ -1102,9 +1063,6 @@ def PanProjectChecks(input_api, output_api,
   snapshot( "checking stray whitespace")
   results.extend(input_api.canned_checks.CheckChangeHasNoStrayWhitespace(
       input_api, output_api, source_file_filter=sources))
-  snapshot("checking nsobjects")
-  results.extend(_CheckConstNSObject(
-      input_api, output_api, source_file_filter=sources))
   snapshot("checking license")
   results.extend(input_api.canned_checks.CheckLicense(
       input_api, output_api, license_header, source_file_filter=sources))
@@ -1127,20 +1085,29 @@ def PanProjectChecks(input_api, output_api,
 
 def CheckPatchFormatted(input_api, output_api, check_js=False):
   import git_cl
-  cmd = ['cl', 'format', '--dry-run']
+  cmd = ['-C', input_api.change.RepositoryRoot(),
+         'cl', 'format', '--dry-run', '--presubmit']
   if check_js:
     cmd.append('--js')
-  cmd.append(input_api.PresubmitLocalPath())
-
+  presubmit_subdir = input_api.os_path.relpath(
+      input_api.PresubmitLocalPath(), input_api.change.RepositoryRoot())
+  if presubmit_subdir.startswith('..') or presubmit_subdir == '.':
+    presubmit_subdir = ''
+  # If the PRESUBMIT.py is in a parent repository, then format the entire
+  # subrepository. Otherwise, format only the code in the directory that
+  # contains the PRESUBMIT.py.
+  if presubmit_subdir:
+    cmd.append(input_api.PresubmitLocalPath())
   code, _ = git_cl.RunGitWithCode(cmd, suppress_stderr=True)
   if code == 2:
-    short_path = input_api.basename(input_api.PresubmitLocalPath())
-    full_path = input_api.os_path.relpath(input_api.PresubmitLocalPath(),
-                                          input_api.change.RepositoryRoot())
+    if presubmit_subdir:
+      short_path = presubmit_subdir
+    else:
+      short_path = input_api.basename(input_api.change.RepositoryRoot())
     return [output_api.PresubmitPromptWarning(
       'The %s directory requires source formatting. '
-      'Please run git cl format %s%s' %
-      (short_path, '--js ' if check_js else '', full_path))]
+      'Please run: git cl format %s%s' %
+      (short_path, '--js ' if check_js else '', presubmit_subdir))]
   # As this is just a warning, ignore all other errors if the user
   # happens to have a broken clang-format, doesn't use git, etc etc.
   return []
@@ -1164,3 +1131,192 @@ def CheckGNFormatted(input_api, output_api):
   # It's just a warning, so ignore other types of failures assuming they'll be
   # caught elsewhere.
   return warnings
+
+
+def CheckCIPDManifest(input_api, output_api, path=None, content=None):
+  """Verifies that a CIPD ensure file manifest is valid against all platforms.
+
+  Exactly one of "path" or "content" must be provided. An assertion will occur
+  if neither or both are provided.
+
+  Args:
+    path (str): If provided, the filesystem path to the manifest to verify.
+    content (str): If provided, the raw content of the manifest to veirfy.
+  """
+  cipd_bin = 'cipd' if not input_api.is_windows else 'cipd.bat'
+  cmd = [cipd_bin, 'ensure-file-verify']
+  kwargs = {}
+
+  if input_api.is_windows:
+    # Needs to be able to resolve "cipd.bat".
+    kwargs['shell'] = True
+
+  if input_api.verbose:
+    cmd += ['-log-level', 'debug']
+
+  if path:
+    assert content is None, 'Cannot provide both "path" and "content".'
+    cmd += ['-ensure-file', path]
+    name = 'Check CIPD manifest %r' % path
+  elif content:
+    assert path is None, 'Cannot provide both "path" and "content".'
+    cmd += ['-ensure-file=-']
+    kwargs['stdin'] = content
+    # quick and dirty parser to extract checked packages.
+    packages = [
+      l.split()[0] for l in (ll.strip() for ll in content.splitlines())
+      if ' ' in l and not l.startswith('$')
+    ]
+    name = 'Check CIPD packages from string: %r' % (packages,)
+  else:
+    raise Exception('Exactly one of "path" or "content" must be provided.')
+
+  return input_api.Command(
+      name,
+      cmd,
+      kwargs,
+      output_api.PresubmitError)
+
+
+def CheckCIPDPackages(input_api, output_api, platforms, packages):
+  """Verifies that all named CIPD packages can be resolved against all supplied
+  platforms.
+
+  Args:
+    platforms (list): List of CIPD platforms to verify.
+    packages (dict): Mapping of package name to version.
+  """
+  manifest = []
+  for p in platforms:
+    manifest.append('$VerifiedPlatform %s' % (p,))
+  for k, v in packages.iteritems():
+    manifest.append('%s %s' % (k, v))
+  return CheckCIPDManifest(input_api, output_api, content='\n'.join(manifest))
+
+
+def CheckVPythonSpec(input_api, output_api, file_filter=None):
+  """Validates any changed .vpython files with vpython verification tool.
+
+  Args:
+    input_api: Bag of input related interfaces.
+    output_api: Bag of output related interfaces.
+    file_filter: Custom function that takes a path (relative to client root) and
+      returns boolean, which is used to filter files for which to apply the
+      verification to. Defaults to any path ending with .vpython, which captures
+      both global .vpython and <script>.vpython files.
+
+  Returns:
+    A list of input_api.Command objects containing verification commands.
+  """
+  file_filter = file_filter or (lambda f: f.LocalPath().endswith('.vpython'))
+  affected_files = input_api.AffectedFiles(file_filter=file_filter)
+  affected_files = map(lambda f: f.AbsoluteLocalPath(), affected_files)
+
+  commands = []
+  for f in affected_files:
+    commands.append(input_api.Command(
+      'Verify %s' % f,
+      ['vpython', '-vpython-spec', f, '-vpython-tool', 'verify'],
+      {'stderr': input_api.subprocess.STDOUT},
+      output_api.PresubmitError))
+
+  return commands
+
+
+def CheckChangedLUCIConfigs(input_api, output_api):
+  import collections
+  import base64
+  import json
+  import logging
+  import urllib2
+
+  import auth
+  import git_cl
+
+  LUCI_CONFIG_HOST_NAME = 'luci-config.appspot.com'
+
+  cl = git_cl.Changelist()
+  if input_api.change.issue and input_api.gerrit:
+    remote_branch = input_api.gerrit.GetDestRef(input_api.change.issue)
+  else:
+    remote, remote_branch = cl.GetRemoteBranch()
+    if remote_branch.startswith('refs/remotes/%s/' % remote):
+      remote_branch = remote_branch.replace(
+          'refs/remotes/%s/' % remote, 'refs/heads/', 1)
+    if remote_branch.startswith('refs/remotes/branch-heads/'):
+      remote_branch = remote_branch.replace(
+          'refs/remotes/branch-heads/', 'refs/branch-heads/', 1)
+
+  remote_host_url = cl.GetRemoteUrl()
+  if not remote_host_url:
+    return [output_api.PresubmitError(
+        'Remote host url for git has not been defined')]
+  remote_host_url = remote_host_url.rstrip('/')
+  if remote_host_url.endswith('.git'):
+    remote_host_url = remote_host_url[:-len('.git')]
+
+  # authentication
+  try:
+    authenticator = auth.get_authenticator_for_host(
+        LUCI_CONFIG_HOST_NAME, auth.make_auth_config())
+    acc_tkn = authenticator.get_access_token()
+  except auth.AuthenticationError as e:
+    return [output_api.PresubmitError(
+        'Error in authenticating user.', long_text=str(e))]
+
+  def request(endpoint, body=None):
+    api_url = ('https://%s/_ah/api/config/v1/%s'
+               % (LUCI_CONFIG_HOST_NAME, endpoint))
+    req = urllib2.Request(api_url)
+    req.add_header('Authorization', 'Bearer %s' % acc_tkn.token)
+    if body is not None:
+      req.add_header('Content-Type', 'application/json')
+      req.add_data(json.dumps(body))
+    return json.load(urllib2.urlopen(req))
+
+  try:
+    config_sets = request('config-sets').get('config_sets')
+  except urllib2.HTTPError as e:
+    return [output_api.PresubmitError(
+        'Config set request to luci-config failed', long_text=str(e))]
+  if not config_sets:
+    return [output_api.PresubmitWarning('No config_sets were returned')]
+  loc_pref = '%s/+/%s/' % (remote_host_url, remote_branch)
+  logging.debug('Derived location prefix: %s', loc_pref)
+  dir_to_config_set = {
+    '%s/' % cs['location'][len(loc_pref):].rstrip('/'): cs['config_set']
+    for cs in config_sets
+    if cs['location'].startswith(loc_pref) or
+    ('%s/' % cs['location']) == loc_pref
+  }
+  cs_to_files = collections.defaultdict(list)
+  for f in input_api.AffectedFiles():
+    # windows
+    file_path = f.LocalPath().replace(_os.sep, '/')
+    logging.debug('Affected file path: %s', file_path)
+    for dr, cs in dir_to_config_set.iteritems():
+      if dr == '/' or file_path.startswith(dr):
+        cs_to_files[cs].append({
+          'path': file_path[len(dr):] if dr != '/' else file_path,
+          'content': base64.b64encode(
+              '\n'.join(f.NewContents()).encode('utf-8'))
+        })
+  outputs = []
+  for cs, f in cs_to_files.iteritems():
+    try:
+      # TODO(myjang): parallelize
+      res = request(
+          'validate-config', body={'config_set': cs, 'files': f})
+    except urllib2.HTTPError as e:
+      return [output_api.PresubmitError(
+          'Validation request to luci-config failed', long_text=str(e))]
+    for msg in res.get('messages', []):
+      sev = msg['severity']
+      if sev == 'WARNING':
+        out_f = output_api.PresubmitPromptWarning
+      elif sev == 'ERROR' or sev == 'CRITICAL':
+        out_f = output_api.PresubmitError
+      else:
+        out_f = output_api.PresubmitNotifyResult
+      outputs.append(out_f('Config validation: %s' % msg['text']))
+  return outputs

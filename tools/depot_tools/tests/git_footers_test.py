@@ -2,9 +2,11 @@
 
 """Tests for git_footers."""
 
+import json
 import os
 import StringIO
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,6 +37,13 @@ My commit message is my best friend. It is my life. I must master it.
     self.assertEqual(
         git_footers.split_footers('\nActual: footer'),
         ([''], ['Actual: footer'], [('Actual', 'footer')]))
+    self.assertEqual(
+        git_footers.split_footers('H\n\nBug:\nAlso: footer'),
+        (['H', ''], ['Bug:', 'Also: footer'],
+         [('Bug', ''), ('Also', 'footer')]))
+    self.assertEqual(
+        git_footers.split_footers('H\n\nBug:      '),
+        (['H', ''], ['Bug:      '], [('Bug', '')]))
 
     self.assertEqual(
         git_footers.parse_footers(self._message), {})
@@ -45,6 +54,79 @@ My commit message is my best friend. It is my life. I must master it.
         git_footers.parse_footers(self._message + self._position_footer
                                                 + self._position_footer),
         { 'Cr-Commit-Position': [ self._position, self._position ] })
+    self.assertEqual(
+        git_footers.parse_footers(self._message +
+                                  'Bug:\n' +
+                                  self._position_footer),
+        { 'Bug': [''],
+          'Cr-Commit-Position': [ self._position ] })
+
+  def testSkippingBadFooterLines(self):
+    message = ('Title.\n'
+               '\n'
+               'Last: paragraph starts\n'
+               'It-may: contain\n'
+               'bad lines, which should be skipped\n'
+               'For: example\n'
+               '(cherry picked from)\n'
+               'And-only-valid: footers taken')
+    self.assertEqual(git_footers.split_footers(message),
+                     (['Title.',
+                       ''],
+                      ['Last: paragraph starts',
+                       'It-may: contain',
+                       'bad lines, which should be skipped',
+                       'For: example',
+                       '(cherry picked from)',
+                       'And-only-valid: footers taken'],
+                      [('Last', 'paragraph starts'),
+                       ('It-may', 'contain'),
+                       ('For', 'example'),
+                       ('And-only-valid', 'footers taken')]))
+    self.assertEqual(git_footers.parse_footers(message),
+                     {'Last': ['paragraph starts'],
+                      'It-May': ['contain'],
+                      'For': ['example'],
+                      'And-Only-Valid': ['footers taken']})
+
+  def testAvoidingURLs(self):
+    message = ('Someone accidentally put a URL in the footers.\n'
+               '\n'
+               'Followed: by\n'
+               'http://domain.tld\n'
+               'Some: footers')
+    self.assertEqual(git_footers.split_footers(message),
+                     (['Someone accidentally put a URL in the footers.',
+                       ''],
+                      ['Followed: by',
+                       'http://domain.tld',
+                       'Some: footers'],
+                      [('Followed', 'by'),
+                       ('Some', 'footers')]))
+    self.assertEqual(git_footers.parse_footers(message),
+                     {'Followed': ['by'],
+                      'Some': ['footers']})
+
+  def testSplittingLastParagraph(self):
+    message = ('Title.\n'
+               '\n'
+               'The final paragraph has some normal text first.\n'
+               'Followed: by\n'
+               'nonsense trailers and\n'
+               'Some: footers')
+    self.assertEqual(git_footers.split_footers(message),
+                     (['Title.',
+                       '',
+                       'The final paragraph has some normal text first.',
+                       ''],
+                      ['Followed: by',
+                       'nonsense trailers and',
+                       'Some: footers'],
+                      [('Followed', 'by'),
+                       ('Some', 'footers')]))
+    self.assertEqual(git_footers.parse_footers(message),
+                     {'Followed': ['by'],
+                      'Some': ['footers']})
 
   def testGetFooterChangeId(self):
     msg = '\n'.join(['whatever',
@@ -67,8 +149,8 @@ My commit message is my best friend. It is my life. I must master it.
         'header-only\n\nChange-Id: Ixxx')
 
     self.assertEqual(
-        git_footers.add_footer_change_id('header\n\nsome: footter', 'Ixxx'),
-        'header\n\nChange-Id: Ixxx\nsome: footter')
+        git_footers.add_footer_change_id('header\n\nsome: footer', 'Ixxx'),
+        'header\n\nsome: footer\nChange-Id: Ixxx')
 
     self.assertEqual(
         git_footers.add_footer_change_id('header\n\nBUG: yy', 'Ixxx'),
@@ -80,17 +162,22 @@ My commit message is my best friend. It is my life. I must master it.
 
     self.assertEqual(
         git_footers.add_footer_change_id('header\n\nBUG: yy\n\nPos: 1', 'Ixxx'),
-        'header\n\nBUG: yy\n\nChange-Id: Ixxx\nPos: 1')
+        'header\n\nBUG: yy\n\nPos: 1\nChange-Id: Ixxx')
 
     # Special case: first line is never a footer, even if it looks line one.
     self.assertEqual(
         git_footers.add_footer_change_id('header: like footer', 'Ixxx'),
         'header: like footer\n\nChange-Id: Ixxx')
 
+    self.assertEqual(
+        git_footers.add_footer_change_id('Header.\n\nBug: v8\nN=t\nT=z', 'Ix'),
+        'Header.\n\nBug: v8\nChange-Id: Ix\nN=t\nT=z')
+
   def testAddFooter(self):
     self.assertEqual(
         git_footers.add_footer('', 'Key', 'Value'),
         '\nKey: Value')
+
     self.assertEqual(
         git_footers.add_footer('Header with empty line.\n\n', 'Key', 'Value'),
         'Header with empty line.\n\nKey: Value')
@@ -102,7 +189,7 @@ My commit message is my best friend. It is my life. I must master it.
     self.assertEqual(
         git_footers.add_footer('Top\n\nSome: footer', 'Key', 'value',
                                after_keys=['Any']),
-        'Top\n\nKey: value\nSome: footer')
+        'Top\n\nSome: footer\nKey: value')
 
     self.assertEqual(
         git_footers.add_footer('Top\n\nSome: footer', 'Key', 'value',
@@ -114,16 +201,60 @@ My commit message is my best friend. It is my life. I must master it.
                                 'Key', 'value', after_keys=['Some']),
          'Top\n\nSome: footer\nKey: value\nOther: footer')
 
+    self.assertEqual(
+         git_footers.add_footer('Top\n\nSome: footer\nOther: footer',
+                                'Key', 'value', before_keys=['Other']),
+         'Top\n\nSome: footer\nKey: value\nOther: footer')
+
+    self.assertEqual(
+        git_footers.add_footer(
+              'Top\n\nSome: footer\nOther: footer\nFinal: footer',
+              'Key', 'value', after_keys=['Some'], before_keys=['Final']),
+        'Top\n\nSome: footer\nKey: value\nOther: footer\nFinal: footer')
+
+    self.assertEqual(
+        git_footers.add_footer(
+              'Top\n\nSome: footer\nOther: footer\nFinal: footer',
+              'Key', 'value', after_keys=['Other'], before_keys=['Some']),
+        'Top\n\nSome: footer\nOther: footer\nKey: value\nFinal: footer')
+
+  def testRemoveFooter(self):
+    self.assertEqual(
+        git_footers.remove_footer('message', 'Key'),
+        'message')
+
+    self.assertEqual(
+        git_footers.remove_footer('message\n\nSome: footer', 'Key'),
+        'message\n\nSome: footer')
+
+    self.assertEqual(
+        git_footers.remove_footer('message\n\nSome: footer\nKey: value', 'Key'),
+        'message\n\nSome: footer')
+
+    self.assertEqual(
+        git_footers.remove_footer(
+            'message\n\nKey: value\nSome: footer\nKey: value', 'Key'),
+        'message\n\nSome: footer')
+
+
   def testReadStdin(self):
     self.mock(git_footers.sys, 'stdin', StringIO.StringIO(
-        'line\r\notherline\r\n\r\n\r\nFoo: baz'))
+        'line\r\notherline\r\n\r\n\r\nFoo: baz\r\nStill: footer'))
 
     stdout = StringIO.StringIO()
     self.mock(git_footers.sys, 'stdout', stdout)
 
     self.assertEqual(git_footers.main([]), 0)
-    self.assertEqual(stdout.getvalue(), "Foo: baz\n")
+    self.assertEqual(stdout.getvalue(), 'Still: footer\nFoo: baz\n')
 
+  def testToJson(self):
+    self.mock(git_footers.sys, 'stdin', StringIO.StringIO(
+        'line\r\nany spaces\r\n\r\n\r\nFoo: 1\nBar: 2\nFoo: 3'))
+
+    with tempfile.NamedTemporaryFile() as tmp:
+      self.assertEqual(git_footers.main(['--json', tmp.name]), 0)
+      js = json.load(open(tmp.name))
+    self.assertEqual(js, {'Foo': ['3', '1'], 'Bar': ['2']})
 
 
 if __name__ == '__main__':

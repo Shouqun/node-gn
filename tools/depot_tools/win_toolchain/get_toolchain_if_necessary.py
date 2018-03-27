@@ -38,6 +38,10 @@ import tempfile
 import time
 import zipfile
 
+# Environment variable that, if set, specifies the default Visual Studio
+# toolchain root directory to use.
+ENV_TOOLCHAIN_ROOT = 'DEPOT_TOOLS_WIN_TOOLCHAIN_ROOT'
+
 # winreg isn't natively available under CygWin
 if sys.platform == "win32":
   try:
@@ -210,10 +214,14 @@ def SaveTimestampsAndHash(root, sha1):
 def HaveSrcInternalAccess():
   """Checks whether access to src-internal is available."""
   with open(os.devnull, 'w') as nul:
+    # This is required to avoid modal dialog boxes after Git 2.14.1 and Git
+    # Credential Manager for Windows 1.12. See https://crbug.com/755694 and
+    # https://github.com/Microsoft/Git-Credential-Manager-for-Windows/issues/482.
+    child_env = dict(os.environ, GCM_INTERACTIVE='NEVER')
     return subprocess.call(
-        ['git', '-c', 'core.askpass=true', 'remote', 'show',
-         'https://chrome-internal.googlesource.com/chrome/src-internal/'],
-        shell=True, stdin=nul, stdout=nul, stderr=nul) == 0
+       ['git', '-c', 'core.askpass=true', 'remote', 'show',
+        'https://chrome-internal.googlesource.com/chrome/src-internal/'],
+       shell=True, stdin=nul, stdout=nul, stderr=nul, env=child_env) == 0
 
 
 def LooksLikeGoogler():
@@ -366,39 +374,6 @@ def RemoveUnusedToolchains(root):
       RemoveToolchain(root, toolchain[1], True)
 
 
-def GetInstallerName():
-  """Return the name of the Windows 10 Universal C Runtime installer for the
-  current platform, or None if installer is not needed or not applicable.
-  The registry has to be used instead of sys.getwindowsversion() because
-  Python 2.7 is only manifested as being compatible up to Windows 8, so the
-  version APIs helpfully return a maximum of 6.2 (Windows 8).
-  """
-  key_name = r'Software\Microsoft\Windows NT\CurrentVersion'
-  key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_name)
-  value, keytype = winreg.QueryValueEx(key, "CurrentVersion")
-  key.Close()
-  if keytype != winreg.REG_SZ:
-    raise Exception("Unexpected type in registry")
-  if value == '6.1':
-    # Windows 7 and Windows Server 2008 R2
-    return 'Windows6.1-KB2999226-x64.msu'
-  elif value == '6.2':
-    # Windows 8 and Windows Server 2012
-    return 'Windows8-RT-KB2999226-x64.msu'
-  elif value == '6.3':
-    # Windows 8.1, Windows Server 2012 R2, and Windows 10.
-    # The Windows 8.1 installer doesn't work on Windows 10, but it will never
-    # be used because the UCRT is always installed on Windows 10.
-    return 'Windows8.1-KB2999226-x64.msu'
-  else:
-    # Some future OS.
-    return None
-
-
-def InstallUniversalCRTIfNeeded(abs_target_dir):
-  return
-
-
 def EnableCrashDumpCollection():
   """Tell Windows Error Reporting to record crash dumps so that we can diagnose
   linker crashes and other toolchain failures. Documented at:
@@ -407,7 +382,8 @@ def EnableCrashDumpCollection():
   if sys.platform == 'win32' and os.environ.get('CHROME_HEADLESS') == '1':
     key_name = r'SOFTWARE\Microsoft\Windows\Windows Error Reporting'
     try:
-      key = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, key_name)
+      key = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, key_name, 0,
+                               winreg.KEY_WOW64_64KEY | winreg.KEY_ALL_ACCESS)
       # Merely creating LocalDumps is sufficient to enable the defaults.
       winreg.CreateKey(key, "LocalDumps")
       # Disable the WER UI, as documented here:
@@ -426,6 +402,9 @@ def main():
                     help='write information about toolchain to FILE')
   parser.add_option('--force', action='store_true',
                     help='force script to run on non-Windows hosts')
+  parser.add_option('--toolchain-dir',
+                    default=os.getenv(ENV_TOOLCHAIN_ROOT, BASEDIR),
+                    help='directory to install toolchain into')
   options, args = parser.parse_args()
 
   if not (sys.platform.startswith(('cygwin', 'win32')) or options.force):
@@ -447,14 +426,18 @@ def main():
     sys.exit('Desired hash is required.')
   desired_hash = args[0]
 
+  # Create our toolchain destination and "chdir" to it.
+  toolchain_dir = os.path.abspath(options.toolchain_dir)
+  if not os.path.isdir(toolchain_dir):
+    os.makedirs(toolchain_dir)
+  os.chdir(toolchain_dir)
+
   # Move to depot_tools\win_toolchain where we'll store our files, and where
   # the downloader script is.
-  os.chdir(os.path.normpath(os.path.join(BASEDIR)))
-  toolchain_dir = '.'
-  if os.environ.get('GYP_MSVS_VERSION') == '2015':
-    target_dir = os.path.normpath(os.path.join(toolchain_dir, 'vs_files'))
+  if os.environ.get('GYP_MSVS_VERSION') == '2013':
+    target_dir = 'vs2013_files'
   else:
-    target_dir = os.path.normpath(os.path.join(toolchain_dir, 'vs2013_files'))
+    target_dir = 'vs_files'
   if not os.path.isdir(target_dir):
     os.mkdir(target_dir)
   toolchain_target_dir = os.path.join(target_dir, desired_hash)
@@ -535,9 +518,6 @@ def main():
                     options.output_json)
 
   EnableCrashDumpCollection()
-
-  if os.environ.get('GYP_MSVS_VERSION') == '2015':
-    InstallUniversalCRTIfNeeded(abs_toolchain_target_dir)
 
   RemoveUnusedToolchains(target_dir)
 

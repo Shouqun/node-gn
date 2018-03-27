@@ -12,6 +12,7 @@ __version__ = '1.8.0'
 # caching (between all different invocations of presubmit scripts for a given
 # change). We should add it as our presubmit scripts start feeling slow.
 
+import ast  # Exposed through the API.
 import cpplint
 import cPickle  # Exposed through the API.
 import cStringIO  # Exposed through the API.
@@ -43,8 +44,10 @@ from warnings import warn
 import auth
 import fix_encoding
 import gclient_utils
+import git_footers
 import gerrit_util
 import owners
+import owners_finder
 import presubmit_canned_checks
 import rietveld
 import scm
@@ -91,6 +94,7 @@ class PresubmitOutput(object):
     self.input_stream = input_stream
     self.output_stream = output_stream
     self.reviewers = []
+    self.more_cc = []
     self.written_output = []
     self.error_count = 0
 
@@ -133,8 +137,6 @@ class _PresubmitResult(object):
     """
     self._message = message
     self._items = items or []
-    if items:
-      self._items = items
     self._long_text = long_text.rstrip()
 
   def handle(self, output):
@@ -200,8 +202,7 @@ class GerritAccessor(object):
     try:
       return gerrit_util.GetChangeDetail(
           self.host, str(issue),
-          ['ALL_REVISIONS', 'DETAILED_LABELS', 'ALL_COMMITS'],
-          ignore_404=False)
+          ['ALL_REVISIONS', 'DETAILED_LABELS', 'ALL_COMMITS'])
     except gerrit_util.GerritError as e:
       if e.http_status == 404:
         raise Exception('Either Gerrit issue %s doesn\'t exist, or '
@@ -242,14 +243,31 @@ class GerritAccessor(object):
 
     return rev_info['commit']['message']
 
+  def GetDestRef(self, issue):
+    ref = self.GetChangeInfo(issue)['branch']
+    if not ref.startswith('refs/'):
+      # NOTE: it is possible to create 'refs/x' branch,
+      # aka 'refs/heads/refs/x'. However, this is ill-advised.
+      ref = 'refs/heads/%s' % ref
+    return ref
+
   def GetChangeOwner(self, issue):
     return self.GetChangeInfo(issue)['owner']['email']
 
   def GetChangeReviewers(self, issue, approving_only=True):
-    cr = self.GetChangeInfo(issue)['labels']['Code-Review']
-    max_value = max(int(k) for k in cr['values'].keys())
-    return [r.get('email') for r in cr.get('all', [])
-            if not approving_only or r.get('value', 0) == max_value]
+    changeinfo = self.GetChangeInfo(issue)
+    if approving_only:
+      labelinfo = changeinfo.get('labels', {}).get('Code-Review', {})
+      values = labelinfo.get('values', {}).keys()
+      try:
+        max_value = max(int(v) for v in values)
+        reviewers = [r for r in labelinfo.get('all', [])
+                     if r.get('value', 0) == max_value]
+      except ValueError:  # values is the empty list
+        reviewers = []
+    else:
+      reviewers = changeinfo.get('reviewers', {}).get('REVIEWER', [])
+    return [r.get('email') for r in reviewers]
 
 
 class OutputApi(object):
@@ -264,12 +282,66 @@ class OutputApi(object):
 
   def __init__(self, is_committing):
     self.is_committing = is_committing
+    self.more_cc = []
+
+  def AppendCC(self, cc):
+    """Appends a user to cc for this change."""
+    self.more_cc.append(cc)
 
   def PresubmitPromptOrNotify(self, *args, **kwargs):
     """Warn the user when uploading, but only notify if committing."""
     if self.is_committing:
       return self.PresubmitNotifyResult(*args, **kwargs)
     return self.PresubmitPromptWarning(*args, **kwargs)
+
+  def EnsureCQIncludeTrybotsAreAdded(self, cl, bots_to_include, message):
+    """Helper for any PostUploadHook wishing to add CQ_INCLUDE_TRYBOTS.
+
+    Merges the bots_to_include into the current CQ_INCLUDE_TRYBOTS list,
+    keeping it alphabetically sorted. Returns the results that should be
+    returned from the PostUploadHook.
+
+    Args:
+      cl: The git_cl.Changelist object.
+      bots_to_include: A list of strings of bots to include, in the form
+        "master:slave".
+      message: A message to be printed in the case that
+        CQ_INCLUDE_TRYBOTS was updated.
+    """
+    description = cl.GetDescription(force=True)
+    include_re = re.compile(r'^CQ_INCLUDE_TRYBOTS=(.*)$', re.M | re.I)
+
+    prior_bots = []
+    if cl.IsGerrit():
+      trybot_footers = git_footers.parse_footers(description).get(
+          git_footers.normalize_name('Cq-Include-Trybots'), [])
+      for f in trybot_footers:
+        prior_bots += [b.strip() for b in f.split(';') if b.strip()]
+    else:
+      trybot_tags = include_re.finditer(description)
+      for t in trybot_tags:
+        prior_bots += [b.strip() for b in t.group(1).split(';') if b.strip()]
+
+    if set(prior_bots) >= set(bots_to_include):
+      return []
+    all_bots = ';'.join(sorted(set(prior_bots) | set(bots_to_include)))
+
+    if cl.IsGerrit():
+      description = git_footers.remove_footer(
+          description, 'Cq-Include-Trybots')
+      description = git_footers.add_footer(
+          description, 'Cq-Include-Trybots', all_bots,
+          before_keys=['Change-Id'])
+    else:
+      new_include_trybots = 'CQ_INCLUDE_TRYBOTS=%s' % all_bots
+      m = include_re.search(description)
+      if m:
+        description = include_re.sub(new_include_trybots, description)
+      else:
+        description = '%s\n%s\n' % (description, new_include_trybots)
+
+    cl.UpdateDescription(description, force=True)
+    return [self.PresubmitNotifyResult(message)]
 
 
 class InputApi(object):
@@ -343,6 +415,7 @@ class InputApi(object):
 
     # We expose various modules and functions as attributes of the input_api
     # so that presubmit scripts don't have to import them.
+    self.ast = ast
     self.basename = os.path.basename
     self.cPickle = cPickle
     self.cpplint = cpplint
@@ -365,8 +438,13 @@ class InputApi(object):
     self.unittest = unittest
     self.urllib2 = urllib2
 
-    # To easily fork python.
-    self.python_executable = sys.executable
+    self.is_windows = sys.platform == 'win32'
+
+    # Set python_executable to 'python'. This is interpreted in CallCommand to
+    # convert to vpython in order to allow scripts in other repos (e.g. src.git)
+    # to automatically pick up that repo's .vpython file, instead of inheriting
+    # the one in depot_tools.
+    self.python_executable = 'python'
     self.environ = os.environ
 
     # InputApi.platform is the platform you're currently running on.
@@ -386,10 +464,14 @@ class InputApi(object):
     # We carry the canned checks so presubmit scripts can easily use them.
     self.canned_checks = presubmit_canned_checks
 
+    # Temporary files we must manually remove at the end of a run.
+    self._named_temporary_files = []
+
     # TODO(dpranke): figure out a list of all approved owners for a repo
     # in order to be able to handle wildcard OWNERS files?
     self.owners_db = owners.Database(change.RepositoryRoot(),
-        fopen=file, os_path=self.os_path)
+                                     fopen=file, os_path=self.os_path)
+    self.owners_finder = owners_finder.OwnersFinder
     self.verbose = verbose
     self.Command = CommandData
 
@@ -513,10 +595,44 @@ class InputApi(object):
       raise IOError('Access outside the repository root is denied.')
     return gclient_utils.FileRead(file_item, mode)
 
+  def CreateTemporaryFile(self, **kwargs):
+    """Returns a named temporary file that must be removed with a call to
+    RemoveTemporaryFiles().
+
+    All keyword arguments are forwarded to tempfile.NamedTemporaryFile(),
+    except for |delete|, which is always set to False.
+
+    Presubmit checks that need to create a temporary file and pass it for
+    reading should use this function instead of NamedTemporaryFile(), as
+    Windows fails to open a file that is already open for writing.
+
+      with input_api.CreateTemporaryFile() as f:
+        f.write('xyz')
+        f.close()
+        input_api.subprocess.check_output(['script-that', '--reads-from',
+                                           f.name])
+
+
+    Note that callers of CreateTemporaryFile() should not worry about removing
+    any temporary file; this is done transparently by the presubmit handling
+    code.
+    """
+    if 'delete' in kwargs:
+      # Prevent users from passing |delete|; we take care of file deletion
+      # ourselves and this prevents unintuitive error messages when we pass
+      # delete=False and 'delete' is also in kwargs.
+      raise TypeError('CreateTemporaryFile() does not take a "delete" '
+                      'argument, file deletion is handled automatically by '
+                      'the same presubmit_support code that creates InputApi '
+                      'objects.')
+    temp_file = self.tempfile.NamedTemporaryFile(delete=False, **kwargs)
+    self._named_temporary_files.append(temp_file.name)
+    return temp_file
+
   @property
   def tbr(self):
     """Returns if a change is TBR'ed."""
-    return 'TBR' in self.change.tags
+    return 'TBR' in self.change.tags or self.change.TBRsFromDescription()
 
   def RunTests(self, tests_mix, parallel=True):
     tests = []
@@ -550,6 +666,10 @@ class _DiffCache(object):
 
   def GetDiff(self, path, local_root):
     """Get the diff for a particular path."""
+    raise NotImplementedError()
+
+  def GetOldContents(self, path, local_root):
+    """Get the old version for a particular path."""
     raise NotImplementedError()
 
 
@@ -594,6 +714,9 @@ class _GitDiffCache(_DiffCache):
 
     return self._diffs_by_file[path]
 
+  def GetOldContents(self, path, local_root):
+    return scm.GIT.GetOldContents(local_root, path, branch=self._upstream)
+
 
 class AffectedFile(object):
   """Representation of a file in a change."""
@@ -614,6 +737,10 @@ class AffectedFile(object):
 
   def LocalPath(self):
     """Returns the path of this file on the local disk relative to client root.
+
+    This should be used for error messages but not for accessing files,
+    because presubmit checks are run with CWD=PresubmitLocalPath() (which is
+    often != client root).
     """
     return normpath(self._path)
 
@@ -624,8 +751,6 @@ class AffectedFile(object):
 
   def Action(self):
     """Returns the action on this opened file, e.g. A, M, D, etc."""
-    # TODO(maruel): Somewhat crappy, Could be "A" or "A  +" for svn but
-    # different for other SCM.
     return self._action
 
   def IsTestableFile(self):
@@ -637,6 +762,18 @@ class AffectedFile(object):
   def IsTextFile(self):
     """An alias to IsTestableFile for backwards compatibility."""
     return self.IsTestableFile()
+
+  def OldContents(self):
+    """Returns an iterator over the lines in the old version of file.
+
+    The old version is the file before any modifications in the user's
+    workspace, i.e. the "left hand side".
+
+    Contents will be empty if the file is a directory or does not exist.
+    Note: The carriage returns (LF or CR) are stripped off.
+    """
+    return self._diff_cache.GetOldContents(self.LocalPath(),
+                                           self._local_root).splitlines()
 
   def NewContents(self):
     """Returns an iterator over the lines in the new version of file.
@@ -804,6 +941,37 @@ class Change(object):
       raise AttributeError(self, attr)
     return self.tags.get(attr)
 
+  def BugsFromDescription(self):
+    """Returns all bugs referenced in the commit description."""
+    tags = [b.strip() for b in self.tags.get('BUG', '').split(',') if b.strip()]
+    footers = git_footers.parse_footers(self._full_description).get('Bug', [])
+    return sorted(set(tags + footers))
+
+  def ReviewersFromDescription(self):
+    """Returns all reviewers listed in the commit description."""
+    # We don't support a "R:" git-footer for reviewers; that is in metadata.
+    tags = [r.strip() for r in self.tags.get('R', '').split(',') if r.strip()]
+    return sorted(set(tags))
+
+  def TBRsFromDescription(self):
+    """Returns all TBR reviewers listed in the commit description."""
+    tags = [r.strip() for r in self.tags.get('TBR', '').split(',') if r.strip()]
+    # TODO(agable): Remove support for 'Tbr:' when TBRs are programmatically
+    # determined by self-CR+1s.
+    footers = git_footers.parse_footers(self._full_description).get('Tbr', [])
+    return sorted(set(tags + footers))
+
+  # TODO(agable): Delete these once we're sure they're unused.
+  @property
+  def BUG(self):
+    return ','.join(self.BugsFromDescription())
+  @property
+  def R(self):
+    return ','.join(self.ReviewersFromDescription())
+  @property
+  def TBR(self):
+    return ','.join(self.TBRsFromDescription())
+
   def AllFiles(self, root=None):
     """List all files under source control in the repo."""
     raise NotImplementedError()
@@ -822,8 +990,7 @@ class Change(object):
 
     if include_deletes:
       return affected
-    else:
-      return filter(lambda x: x.Action() != 'D', affected)
+    return filter(lambda x: x.Action() != 'D', affected)
 
   def AffectedTestableFiles(self, include_deletes=None):
     """Return a list of the existing text files in a change."""
@@ -865,6 +1032,13 @@ class Change(object):
         x for x in self.AffectedFiles(include_deletes=False)
         if x.IsTestableFile())
 
+  def OriginalOwnersFiles(self):
+    """A map from path names of affected OWNERS files to their old content."""
+    def owners_file_filter(f):
+      return 'OWNERS' in os.path.split(f.LocalPath())[1]
+    files = self.AffectedFiles(file_filter=owners_file_filter)
+    return dict([(f.LocalPath(), f.OldContents()) for f in files])
+
 
 class GitChange(Change):
   _AFFECTED_FILES = GitAffectedFile
@@ -874,7 +1048,8 @@ class GitChange(Change):
     """List all files under source control in the repo."""
     root = root or self.RepositoryRoot()
     return subprocess.check_output(
-        ['git', 'ls-files', '--', '.'], cwd=root).splitlines()
+        ['git', '-c', 'core.quotePath=false', 'ls-files', '--', '.'],
+        cwd=root).splitlines()
 
 
 def ListRelevantPresubmitFiles(files, root):
@@ -1096,42 +1271,6 @@ def DoPostUploadExecuter(change,
   return results
 
 
-# This helper function should be used by any PostUploadHook wishing to
-# add entries to the CQ_INCLUDE_TRYBOTS line. It returns the results
-# that should be returned from the PostUploadHook.
-def EnsureCQIncludeTrybotsAreAdded(cl, bots_to_include, message, output_api):
-  """Helper to be used by any PostUploadHook wishing to add CQ_INCLUDE_TRYBOTS.
-
-  Merges the bots_to_include into the current CQ_INCLUDE_TRYBOTS list,
-  keeping it alphabetically sorted. Returns the results that should be
-  returned from the PostUploadHook.
-
-  Args:
-    cl: The git_cl.Changelist object.
-    bots_to_include: A list of strings of bots to include, in the form
-      "master:slave".
-    message: A message to be printed in the case that
-      CQ_INCLUDE_TRYBOTS was updated.
-    output_api: An OutputApi instance used to display messages.
-  """
-  rietveld_obj = cl.RpcServer()
-  issue = cl.issue
-  description = rietveld_obj.get_description(issue)
-  all_bots = []
-  include_re = re.compile(r'^CQ_INCLUDE_TRYBOTS=(.*)', re.M | re.I)
-  m = include_re.search(description)
-  if m:
-    all_bots = [i.strip() for i in m.group(1).split(';') if i.strip()]
-  if not (set(all_bots) - set(bots_to_include)):
-    return []
-  # Sort the bots to keep them in some consistent order -- not required.
-  all_bots = sorted(set(all_bots) | set(bots_to_include))
-  new_include_trybots = 'CQ_INCLUDE_TRYBOTS=%s' % ';'.join(all_bots)
-  new_description = include_re.sub(new_include_trybots, description)
-  rietveld_obj.update_description(issue, new_description)
-  return [output_api.PresubmitNotifyResult(message)]
-
-
 class PresubmitExecuter(object):
   def __init__(self, change, committing, rietveld_obj, verbose,
                gerrit_obj=None, dry_run=None):
@@ -1149,6 +1288,7 @@ class PresubmitExecuter(object):
     self.gerrit = gerrit_obj
     self.verbose = verbose
     self.dry_run = dry_run
+    self.more_cc = []
 
   def ExecPresubmitScript(self, script_text, presubmit_path):
     """Executes a single presubmit script.
@@ -1170,6 +1310,7 @@ class PresubmitExecuter(object):
     input_api = InputApi(self.change, presubmit_path, self.committing,
                          self.rietveld, self.verbose,
                          gerrit_obj=self.gerrit, dry_run=self.dry_run)
+    output_api = OutputApi(self.committing)
     context = {}
     try:
       exec script_text in context
@@ -1183,10 +1324,14 @@ class PresubmitExecuter(object):
     else:
       function_name = 'CheckChangeOnUpload'
     if function_name in context:
-      context['__args'] = (input_api, OutputApi(self.committing))
-      logging.debug('Running %s in %s', function_name, presubmit_path)
-      result = eval(function_name + '(*__args)', context)
-      logging.debug('Running %s done.', function_name)
+      try:
+        context['__args'] = (input_api, output_api)
+        logging.debug('Running %s in %s', function_name, presubmit_path)
+        result = eval(function_name + '(*__args)', context)
+        logging.debug('Running %s done.', function_name)
+        self.more_cc.extend(output_api.more_cc)
+      finally:
+        map(os.remove, input_api._named_temporary_files)
       if not (isinstance(result, types.TupleType) or
               isinstance(result, types.ListType)):
         raise PresubmitFailure(
@@ -1277,6 +1422,7 @@ def DoPresubmitChecks(change,
       presubmit_script = gclient_utils.FileRead(filename, 'rU')
       results += executer.ExecPresubmitScript(presubmit_script, filename)
 
+    output.more_cc.extend(executer.more_cc)
     errors = []
     notifications = []
     warnings = []
@@ -1327,17 +1473,17 @@ def DoPresubmitChecks(change,
 def ScanSubDirs(mask, recursive):
   if not recursive:
     return [x for x in glob.glob(mask) if x not in ('.svn', '.git')]
-  else:
-    results = []
-    for root, dirs, files in os.walk('.'):
-      if '.svn' in dirs:
-        dirs.remove('.svn')
-      if '.git' in dirs:
-        dirs.remove('.git')
-      for name in files:
-        if fnmatch.fnmatch(name, mask):
-          results.append(os.path.join(root, name))
-    return results
+
+  results = []
+  for root, dirs, files in os.walk('.'):
+    if '.svn' in dirs:
+      dirs.remove('.svn')
+    if '.git' in dirs:
+      dirs.remove('.git')
+    for name in files:
+      if fnmatch.fnmatch(name, mask):
+        results.append(os.path.join(root, name))
+  return results
 
 
 def ParseFiles(args, recursive):
@@ -1391,12 +1537,24 @@ def CallCommand(cmd_data):
   multiprocessing module.
 
   multiprocessing needs a top level function with a single argument.
+
+  This function converts invocation of .py files and invocations of "python" to
+  vpython invocations.
   """
+  vpython = 'vpython.bat' if sys.platform == 'win32' else 'vpython'
+
+  cmd = cmd_data.cmd
+  if cmd[0] == 'python':
+    cmd = list(cmd)
+    cmd[0] = vpython
+  elif cmd[0].endswith('.py'):
+    cmd = [vpython] + cmd
+
   cmd_data.kwargs['stdout'] = subprocess.PIPE
   cmd_data.kwargs['stderr'] = subprocess.STDOUT
   try:
     start = time.time()
-    (out, _), code = subprocess.communicate(cmd_data.cmd, **cmd_data.kwargs)
+    (out, _), code = subprocess.communicate(cmd, **cmd_data.kwargs)
     duration = time.time() - start
   except OSError as e:
     duration = time.time() - start
@@ -1452,9 +1610,6 @@ def main(argv=None):
   parser.add_option("--rietveld_email_file", help=optparse.SUPPRESS_HELP)
   parser.add_option("--rietveld_private_key_file", help=optparse.SUPPRESS_HELP)
 
-  # TODO(phajdan.jr): Update callers and remove obsolete --trybot-json .
-  parser.add_option("--trybot-json",
-                    help="Output trybot information to the file specified.")
   auth.add_auth_options(parser)
   options, args = parser.parse_args(argv)
   auth_config = auth.extract_auth_config_from_options(options)
@@ -1544,7 +1699,6 @@ def main(argv=None):
   except PresubmitFailure, e:
     print >> sys.stderr, e
     print >> sys.stderr, 'Maybe your depot_tools is out of date?'
-    print >> sys.stderr, 'If all fails, contact maruel@'
     return 2
 
 

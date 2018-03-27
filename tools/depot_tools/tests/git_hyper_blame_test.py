@@ -6,6 +6,7 @@
 
 import datetime
 import os
+import re
 import shutil
 import StringIO
 import sys
@@ -19,6 +20,8 @@ from testing_support import coverage_utils
 from testing_support import git_test_utils
 
 import git_common
+
+GitRepo = git_test_utils.GitRepo
 
 
 class GitHyperBlameTestBase(git_test_utils.GitRepoReadOnlyTestBase):
@@ -36,16 +39,21 @@ class GitHyperBlameTestBase(git_test_utils.GitRepoReadOnlyTestBase):
                            revision=revision, out=stdout, err=stderr)
     return retval, stdout.getvalue().rstrip().split('\n')
 
-  def blame_line(self, commit_name, rest, filename=None):
+  def blame_line(self, commit_name, rest, author=None, filename=None):
     """Generate a blame line from a commit.
 
     Args:
       commit_name: The commit's schema name.
       rest: The blame line after the timestamp. e.g., '2) file2 - merged'.
+      author: The author's name. If omitted, reads the name out of the commit.
+      filename: The filename. If omitted, not shown in the blame line.
     """
     short = self.repo[commit_name][:8]
     start = '%s %s' % (short, filename) if filename else short
-    author = self.repo.show_commit(commit_name, format_string='%an %ai')
+    if author is None:
+      author = self.repo.show_commit(commit_name, format_string='%an %ai')
+    else:
+      author += self.repo.show_commit(commit_name, format_string=' %ai')
     return '%s (%s %s' % (start, author, rest)
 
 class GitHyperBlameMainTest(GitHyperBlameTestBase):
@@ -121,7 +129,8 @@ class GitHyperBlameMainTest(GitHyperBlameTestBase):
 
     self.assertNotEqual(0, retval)
     self.assertEqual('', stdout.getvalue())
-    self.assertRegexpMatches(stderr.getvalue(), '^fatal: Not a git repository')
+    r = re.compile('^fatal: Not a git repository', re.I)
+    self.assertRegexpMatches(stderr.getvalue(), r)
 
   def testBadFilename(self):
     """Tests the main function (bad filename)."""
@@ -132,8 +141,12 @@ class GitHyperBlameMainTest(GitHyperBlameTestBase):
                            stdout=stdout, stderr=stderr)
     self.assertNotEqual(0, retval)
     self.assertEqual('', stdout.getvalue())
-    self.assertEqual('fatal: no such path some/files/xxxx in %s\n' %
-                     self.repo['C'], stderr.getvalue())
+    # TODO(mgiuca): This test used to test the exact string, but it broke due to
+    # an upstream bug in git-blame. For now, just check the start of the string.
+    # A patch has been sent upstream; when it rolls out we can revert back to
+    # the original test logic.
+    self.assertTrue(
+        stderr.getvalue().startswith('fatal: no such path some/files/xxxx in '))
 
   def testBadRevision(self):
     """Tests the main function (bad revision to blame from)."""
@@ -212,6 +225,26 @@ class GitHyperBlameMainTest(GitHyperBlameTestBase):
     retval = self.repo.run(self.git_hyper_blame.main,
                            args=['tag_C', 'some/files/file'],
                            stdout=stdout, stderr=stderr)
+
+    self.assertEqual(0, retval)
+    self.assertEqual(expected_output, stdout.getvalue().rstrip().split('\n'))
+    self.assertEqual('', stderr.getvalue())
+
+  def testNoDefaultIgnores(self):
+    """Tests the --no-default-ignores switch."""
+    # Check out revision D. This has a .git-blame-ignore-revs file, which we
+    # expect to be ignored due to --no-default-ignores.
+    self.repo.git('checkout', '-f', 'tag_D')
+
+    expected_output = [self.blame_line('C', '1) line 1.1'),
+                       self.blame_line('B', '2) line 2.1')]
+    stdout = StringIO.StringIO()
+    stderr = StringIO.StringIO()
+
+    retval = self.repo.run(
+        self.git_hyper_blame.main,
+        args=['tag_D', 'some/files/file', '--no-default-ignores'],
+        stdout=stdout, stderr=stderr)
 
     self.assertEqual(0, retval)
     self.assertEqual(expected_output, stdout.getvalue().rstrip().split('\n'))
@@ -494,6 +527,111 @@ class GitHyperBlameLineMotionTest(GitHyperBlameTestBase):
                        self.blame_line('C', ' 9) Z'),
                        ]
     retval, output = self.run_hyperblame(['E'], 'file', 'tag_E')
+    self.assertEqual(0, retval)
+    self.assertEqual(expected_output, output)
+
+
+class GitHyperBlameLineNumberTest(GitHyperBlameTestBase):
+  REPO_SCHEMA = """
+  A B C D
+  """
+
+  COMMIT_A = {
+    'file':  {'data': 'red\nblue\n'},
+  }
+
+  # Change "blue" to "green".
+  COMMIT_B = {
+    'file': {'data': 'red\ngreen\n'},
+  }
+
+  # Insert 2 lines at the top,
+  COMMIT_C = {
+    'file': {'data': '\n\nred\ngreen\n'},
+  }
+
+  # Change "green" to "yellow".
+  COMMIT_D = {
+    'file': {'data': '\n\nred\nyellow\n'},
+  }
+
+  def testTwoChangesWithAddedLines(self):
+    """Regression test for https://crbug.com/709831.
+
+    Tests a line with multiple ignored edits, and a line number change in
+    between (such that the line number in the current revision is bigger than
+    the file's line count at the older ignored revision).
+    """
+    expected_output = [self.blame_line('C', ' 1) '),
+                       self.blame_line('C', ' 2) '),
+                       self.blame_line('A', ' 3) red'),
+                       self.blame_line('A', '4*) yellow'),
+                       ]
+    # Due to https://crbug.com/709831, ignoring both B and D would crash,
+    # because of C (in between those revisions) which moves Line 2 to Line 4.
+    # The algorithm would incorrectly think that Line 4 was still on Line 4 in
+    # Commit B, even though it was Line 2 at that time. Its index is out of
+    # range in the number of lines in Commit B.
+    retval, output = self.run_hyperblame(['B', 'D'], 'file', 'tag_D')
+    self.assertEqual(0, retval)
+    self.assertEqual(expected_output, output)
+
+
+class GitHyperBlameUnicodeTest(GitHyperBlameTestBase):
+  REPO_SCHEMA = """
+  A B C
+  """
+
+  COMMIT_A = {
+    GitRepo.AUTHOR_NAME: 'ASCII Author',
+    'file':  {'data': 'red\nblue\n'},
+  }
+
+  # Add a line.
+  COMMIT_B = {
+    GitRepo.AUTHOR_NAME: u'\u4e2d\u56fd\u4f5c\u8005'.encode('utf-8'),
+    'file': {'data': 'red\ngreen\nblue\n'},
+  }
+
+  # Modify a line with non-UTF-8 author and file text.
+  COMMIT_C = {
+    GitRepo.AUTHOR_NAME: u'Lat\u00edn-1 Author'.encode('latin-1'),
+    'file': {'data': u'red\ngre\u00e9n\nblue\n'.encode('latin-1')},
+  }
+
+  def testNonASCIIAuthorName(self):
+    """Ensures correct tabulation.
+
+    Tests the case where there are non-ASCII (UTF-8) characters in the author
+    name.
+
+    Regression test for https://crbug.com/808905.
+    """
+    expected_output = [
+        self.blame_line('A', '1) red', author='ASCII Author'),
+        # Expect 8 spaces, to line up with the other name.
+        self.blame_line('B', '2) green',
+            author=u'\u4e2d\u56fd\u4f5c\u8005        '.encode('utf-8')),
+        self.blame_line('A', '3) blue', author='ASCII Author'),
+    ]
+    retval, output = self.run_hyperblame([], 'file', 'tag_B')
+    self.assertEqual(0, retval)
+    self.assertEqual(expected_output, output)
+
+  def testNonUTF8Data(self):
+    """Ensures correct behaviour even if author or file data is not UTF-8.
+
+    There is no guarantee that a file will be UTF-8-encoded, so this is
+    realistic.
+    """
+    expected_output = [
+        self.blame_line('A', '1) red', author='ASCII Author  '),
+        # The Author has been re-encoded as UTF-8. The file data is preserved as
+        # raw byte data.
+        self.blame_line('C', '2) gre\xe9n', author='Lat\xc3\xadn-1 Author'),
+        self.blame_line('A', '3) blue', author='ASCII Author  '),
+    ]
+    retval, output = self.run_hyperblame([], 'file', 'tag_C')
     self.assertEqual(0, retval)
     self.assertEqual(expected_output, output)
 

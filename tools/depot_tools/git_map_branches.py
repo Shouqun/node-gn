@@ -3,8 +3,7 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
-"""Provides a short mapping of all the branches in your local repo, organized
-by their upstream ('tracking branch') layout.
+"""Print dependency tree of branches in local repo.
 
 Example:
 origin/master
@@ -270,13 +269,29 @@ class BranchMapper(object):
 
     # The subject of the most recent commit on the branch.
     if self.show_subject:
-      line.append(run('log', '-n1', '--format=%s', branch, '--'))
+      if branch:
+        line.append(run('log', '-n1', '--format=%s', branch, '--'))
+      else:
+        line.append('')
 
     self.output.append(line)
 
     for child in sorted(self.__parent_map.pop(branch, ())):
       self.__append_branch(child, depth=depth + 1)
 
+
+def print_desc():
+  for line in __doc__.splitlines():
+    starpos = line.find('* ')
+    if starpos == -1 or '-' not in line:
+      print(line)
+    else:
+      _, color, rest = line.split(None, 2)
+      outline = line[:starpos+1]
+      outline += getattr(Fore, color.upper()) + " " + color + " " + Fore.RESET
+      outline += rest
+      print(outline)
+  print('')
 
 def main(argv):
   setup_color.init()
@@ -287,10 +302,13 @@ def main(argv):
         '.'.join(str(x) for x in MIN_UPSTREAM_TRACK_GIT_VERSION) +
         '. Please consider upgrading.')
 
-  parser = argparse.ArgumentParser(
-      description='Print a a tree of all branches parented by their upstreams')
+  if '-h' in argv:
+    print_desc()
+
+  parser = argparse.ArgumentParser()
   parser.add_argument('-v', action='count',
-                      help='Display branch hash and Rietveld URL')
+                      help=('Pass once to show tracking info; '
+                           'twice for hash and review url'))
   parser.add_argument('--no-color', action='store_true', dest='nocolor',
                       help='Turn off colors.')
   parser.add_argument(

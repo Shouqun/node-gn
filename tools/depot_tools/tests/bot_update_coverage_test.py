@@ -14,34 +14,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'recipe_modules', 'bot_update', 'resources'))
+    'recipes', 'recipe_modules', 'bot_update', 'resources'))
 import bot_update
-
-DEFAULT_PARAMS = {
-    'solutions': [{
-        'name': 'somename',
-        'url': 'https://fake.com'
-    }],
-    'revisions': [],
-    'first_sln': 'somename',
-    'target_os': None,
-    'target_os_only': None,
-    'patch_root': None,
-    'issue': None,
-    'patchset': None,
-    'rietveld_server': None,
-    'gerrit_repo': None,
-    'gerrit_ref': None,
-    'gerrit_rebase_patch_ref': None,
-    'revision_mapping': {},
-    'apply_issue_email_file': None,
-    'apply_issue_key_file': None,
-    'apply_issue_oauth2_file': None,
-    'shallow': False,
-    'refs': [],
-    'git_cache_dir': '',
-    'gerrit_reset': None,
-}
 
 
 class MockedPopen(object):
@@ -122,11 +96,13 @@ class MockedGclientSync():
   def __init__(self, fake_filesystem):
     self.output = {}
     self.fake_filesystem = fake_filesystem
+    self.records = []
 
   def __call__(self, *args, **_):
     output_json_index = args.index('--output-json') + 1
     with self.fake_filesystem.open(args[output_json_index], 'w') as f:
       json.dump(self.output, f)
+    self.records.append(args)
 
 
 class FakeFile():
@@ -162,6 +138,29 @@ def fake_git(*args, **kwargs):
 
 
 class BotUpdateUnittests(unittest.TestCase):
+  DEFAULT_PARAMS = {
+      'solutions': [{
+          'name': 'somename',
+          'url': 'https://fake.com'
+      }],
+      'revisions': {},
+      'first_sln': 'somename',
+      'target_os': None,
+      'target_os_only': None,
+      'target_cpu': None,
+      'patch_root': None,
+      'gerrit_repo': None,
+      'gerrit_ref': None,
+      'gerrit_rebase_patch_ref': None,
+      'shallow': False,
+      'refs': [],
+      'git_cache_dir': '',
+      'cleanup_dir': None,
+      'gerrit_reset': None,
+      'disable_syntax_validation': False,
+      'apply_patch_on_gclient': False,
+  }
+
   def setUp(self):
     sys.platform = 'linux2'  # For consistency, ya know?
     self.filesystem = FakeFilesystem()
@@ -171,7 +170,7 @@ class BotUpdateUnittests(unittest.TestCase):
         (sys.executable, '-u', bot_update.GCLIENT_PATH, 'sync')
     ).returns(self.gclient)
     self.old_call = getattr(bot_update, 'call')
-    self.params = copy.deepcopy(DEFAULT_PARAMS)
+    self.params = copy.deepcopy(self.DEFAULT_PARAMS)
     setattr(bot_update, 'call', self.call)
     setattr(bot_update, 'git', fake_git)
 
@@ -203,6 +202,36 @@ class BotUpdateUnittests(unittest.TestCase):
     bot_update.ensure_checkout(**self.params)
     return self.call.records
 
+  def testBasicRevision(self):
+    self.params['revisions'] = {
+        'src': 'HEAD', 'src/v8': 'deadbeef', 'somename': 'DNE'}
+    bot_update.ensure_checkout(**self.params)
+    args = self.gclient.records[0]
+    idx_first_revision = args.index('--revision')
+    idx_second_revision = args.index(
+        '--revision', idx_first_revision+1)
+    idx_third_revision = args.index('--revision', idx_second_revision+1)
+    self.assertEquals(args[idx_first_revision+1], 'somename@unmanaged')
+    self.assertEquals(args[idx_second_revision+1], 'src@origin/master')
+    self.assertEquals(args[idx_third_revision+1], 'src/v8@deadbeef')
+    return self.call.records
+
+  def testEnableGclientExperiment(self):
+    self.params['gerrit_ref'] = 'refs/changes/12/345/6'
+    self.params['gerrit_repo'] = 'https://chromium.googlesource.com/v8/v8'
+    self.params['apply_patch_on_gclient'] = True
+    bot_update.ensure_checkout(**self.params)
+    args = self.gclient.records[0]
+    idx = args.index('--patch-ref')
+    self.assertEqual(
+        args[idx+1],
+        self.params['gerrit_repo'] + '@' + self.params['gerrit_ref'])
+    self.assertNotIn('--patch-ref', args[idx+1:])
+    # Assert we're not patching in bot_update.py
+    for record in self.call.records:
+      self.assertNotIn('git fetch ' + self.params['gerrit_repo'],
+                       ' '.join(record[0]))
+
   def testBreakLocks(self):
     self.overrideSetupForWindows()
     bot_update.ensure_checkout(**self.params)
@@ -226,6 +255,38 @@ class BotUpdateUnittests(unittest.TestCase):
     setattr(os, 'walk', old_os_walk)
     setattr(os, 'remove', old_os_remove)
     self.assertTrue(os.path.join(path, lockfile) in removed)
+
+  def testGenerateManifestsBasic(self):
+    gclient_output = {
+			'solutions': {
+				'breakpad/': {
+					'revision': None,
+					'scm': None,
+					'url': ('https://chromium.googlesource.com/breakpad/breakpad.git' +
+                  '@5f638d532312685548d5033618c8a36f73302d0a')
+				},
+				"src/": {
+					'revision': 'f671d3baeb64d9dba628ad582e867cf1aebc0207',
+					'scm': None,
+					'url': 'https://chromium.googlesource.com/a/chromium/src.git'
+				},
+      }
+    }
+    out = bot_update.create_manifest(gclient_output, None, None)
+    self.assertEquals(len(out['directories']), 2)
+    print out
+    self.assertEquals(
+        out['directories']['src']['git_checkout']['revision'],
+        'f671d3baeb64d9dba628ad582e867cf1aebc0207')
+    self.assertEquals(
+        out['directories']['src']['git_checkout']['repo_url'],
+        'https://chromium.googlesource.com/chromium/src')
+    self.assertEquals(
+        out['directories']['breakpad']['git_checkout']['revision'],
+        '5f638d532312685548d5033618c8a36f73302d0a')
+    self.assertEquals(
+        out['directories']['breakpad']['git_checkout']['repo_url'],
+        'https://chromium.googlesource.com/breakpad/breakpad')
 
 
 if __name__ == '__main__':

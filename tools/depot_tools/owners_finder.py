@@ -22,10 +22,11 @@ class OwnersFinder(object):
 
   indentation = 0
 
-  def __init__(self, files, local_root, author,
+  def __init__(self, files, local_root, author, reviewers,
                fopen, os_path,
                email_postfix='@chromium.org',
-               disable_color=False):
+               disable_color=False,
+               override_files=None):
     self.email_postfix = email_postfix
 
     if os.name == 'nt' or disable_color:
@@ -35,6 +36,7 @@ class OwnersFinder(object):
       self.COLOR_RESET = ''
 
     self.db = owners_module.Database(local_root, fopen, os_path)
+    self.db.override_files = override_files or {}
     self.db.load_data_needed_for(files)
 
     self.os_path = os_path
@@ -43,15 +45,20 @@ class OwnersFinder(object):
 
     filtered_files = files
 
-    # Eliminate files that the author can review.
+    reviewers = list(reviewers)
+    if author:
+      reviewers.append(author)
+
+    # Eliminate files that existing reviewers can review.
     filtered_files = list(self.db.files_not_covered_by(
-      filtered_files, [author] if author else []))
+        filtered_files, reviewers))
 
     # If some files are eliminated.
     if len(filtered_files) != len(files):
       files = filtered_files
       # Reload the database.
       self.db = owners_module.Database(local_root, fopen, os_path)
+      self.db.override_files = override_files or {}
       self.db.load_data_needed_for(files)
 
     self.all_possible_owners = self.db.all_possible_owners(files, None)
@@ -207,8 +214,17 @@ class OwnersFinder(object):
     else:
       self.writeln(self.bold_name(owner) + ' is commented as:')
       self.indent()
+      if owners_module.GLOBAL_STATUS in self.comments[owner]:
+        self.writeln(
+            self.greyed(self.comments[owner][owners_module.GLOBAL_STATUS]) +
+            ' (global status)')
+        if len(self.comments[owner]) == 1:
+          self.unindent()
+          return
       for path in self.comments[owner]:
-        if len(self.comments[owner][path]) > 0:
+        if path == owners_module.GLOBAL_STATUS:
+          continue
+        elif len(self.comments[owner][path]) > 0:
           self.writeln(self.greyed(self.comments[owner][path]) +
                        ' (at ' + self.bold(path or '<root>') + ')')
         else:

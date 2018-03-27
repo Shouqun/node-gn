@@ -6,6 +6,7 @@
 """A git command for managing a local cache of git repositories."""
 
 from __future__ import print_function
+import contextlib
 import errno
 import logging
 import optparse
@@ -223,12 +224,23 @@ class Mirror(object):
   def print_without_file(self, message, **_kwargs):
     self.print_func(message)
 
+  @contextlib.contextmanager
+  def print_duration_of(self, what):
+    start = time.time()
+    try:
+      yield
+    finally:
+      self.print('%s took %.1f minutes' % (what, (time.time() - start) / 60.0))
+
   @property
   def bootstrap_bucket(self):
-    if 'chrome-internal' in self.url:
-      return 'chrome-git-cache'
-    else:
+    u = urlparse.urlparse(self.url)
+    if u.netloc == 'chromium.googlesource.com':
       return 'chromium-git-cache'
+    elif u.netloc == 'chrome-internal.googlesource.com':
+      return 'chrome-git-cache'
+    # Not recognized.
+    return None
 
   @classmethod
   def FromPath(cls, path):
@@ -304,7 +316,8 @@ class Mirror(object):
     # Don't combine pack files into one big pack file.  It's really slow for
     # repositories, and there's no way to track progress and make sure it's
     # not stuck.
-    self.RunGit(['config', 'gc.autopacklimit', '0'], cwd=cwd)
+    if self.supported_project():
+      self.RunGit(['config', 'gc.autopacklimit', '0'], cwd=cwd)
 
     # Allocate more RAM for cache-ing delta chains, for better performance
     # of "Resolving deltas".
@@ -320,11 +333,12 @@ class Mirror(object):
           cwd=cwd)
 
   def bootstrap_repo(self, directory):
-    """Bootstrap the repo from Google Stroage if possible.
+    """Bootstrap the repo from Google Storage if possible.
 
     More apt-ly named bootstrap_repo_from_cloud_if_possible_else_do_nothing().
     """
-
+    if not self.bootstrap_bucket:
+      return False
     python_fallback = False
     if (sys.platform.startswith('win') and
         not gclient_utils.FindExecutable('7z')):
@@ -338,10 +352,13 @@ class Mirror(object):
     gs_folder = 'gs://%s/%s' % (self.bootstrap_bucket, self.basedir)
     gsutil = Gsutil(self.gsutil_exe, boto_path=None)
     # Get the most recent version of the zipfile.
-    _, ls_out, _ = gsutil.check_call('ls', gs_folder)
+    _, ls_out, ls_err = gsutil.check_call('ls', gs_folder)
     ls_out_sorted = sorted(ls_out.splitlines())
     if not ls_out_sorted:
       # This repo is not on Google Storage.
+      self.print('No bootstrap file for %s found in %s, stderr:\n  %s' %
+                 (self.mirror_path, self.bootstrap_bucket,
+                  '  '.join((ls_err or '').splitlines(True))))
       return False
     latest_checkout = ls_out_sorted[-1]
 
@@ -349,28 +366,30 @@ class Mirror(object):
     try:
       tempdir = tempfile.mkdtemp(prefix='_cache_tmp', dir=self.GetCachePath())
       self.print('Downloading %s' % latest_checkout)
-      code = gsutil.call('cp', latest_checkout, tempdir)
+      with self.print_duration_of('download'):
+        code = gsutil.call('cp', latest_checkout, tempdir)
       if code:
         return False
       filename = os.path.join(tempdir, latest_checkout.split('/')[-1])
 
       # Unpack the file with 7z on Windows, unzip on linux, or fallback.
-      if not python_fallback:
-        if sys.platform.startswith('win'):
-          cmd = ['7z', 'x', '-o%s' % directory, '-tzip', filename]
+      with self.print_duration_of('unzip'):
+        if not python_fallback:
+          if sys.platform.startswith('win'):
+            cmd = ['7z', 'x', '-o%s' % directory, '-tzip', filename]
+          else:
+            cmd = ['unzip', filename, '-d', directory]
+          retcode = subprocess.call(cmd)
         else:
-          cmd = ['unzip', filename, '-d', directory]
-        retcode = subprocess.call(cmd)
-      else:
-        try:
-          with zipfile.ZipFile(filename, 'r') as f:
-            f.printdir()
-            f.extractall(directory)
-        except Exception as e:
-          self.print('Encountered error: %s' % str(e), file=sys.stderr)
-          retcode = 1
-        else:
-          retcode = 0
+          try:
+            with zipfile.ZipFile(filename, 'r') as f:
+              f.printdir()
+              f.extractall(directory)
+          except Exception as e:
+            self.print('Encountered error: %s' % str(e), file=sys.stderr)
+            retcode = 1
+          else:
+            retcode = 0
     finally:
       # Clean up the downloaded zipfile.
       #
@@ -390,8 +409,33 @@ class Mirror(object):
       return False
     return True
 
+  def contains_revision(self, revision):
+    if not self.exists():
+      return False
+
+    if sys.platform.startswith('win'):
+      # Windows .bat scripts use ^ as escape sequence, which means we have to
+      # escape it with itself for every .bat invocation.
+      needle = '%s^^^^{commit}' % revision
+    else:
+      needle = '%s^{commit}' % revision
+    try:
+      # cat-file exits with 0 on success, that is git object of given hash was
+      # found.
+      self.RunGit(['cat-file', '-e', needle])
+      return True
+    except subprocess.CalledProcessError:
+      return False
+
   def exists(self):
     return os.path.isfile(os.path.join(self.mirror_path, 'config'))
+
+  def supported_project(self):
+    """Returns true if this repo is known to have a bootstrap zip file."""
+    u = urlparse.urlparse(self.url)
+    return u.netloc in [
+        'chromium.googlesource.com',
+        'chrome-internal.googlesource.com']
 
   def _preserve_fetchspec(self):
     """Read and preserve remote.origin.fetch from an existing mirror.
@@ -419,6 +463,8 @@ class Mirror(object):
 
     if os.path.isdir(pack_dir):
       pack_files = [f for f in os.listdir(pack_dir) if f.endswith('.pack')]
+      self.print('%s has %d .pack files, re-bootstrapping if >%d' %
+                 (self.mirror_path, len(pack_files), GC_AUTOPACKLIMIT))
 
     should_bootstrap = (force or
                         not self.exists() or
@@ -433,14 +479,17 @@ class Mirror(object):
       if bootstrapped:
         # Bootstrap succeeded; delete previous cache, if any.
         gclient_utils.rmtree(self.mirror_path)
-      elif not self.exists():
-        # Bootstrap failed, no previous cache; start with a bare git dir.
+      elif not self.exists() or not self.supported_project():
+        # Bootstrap failed due to either
+        # 1. No previous cache
+        # 2. Project doesn't have a bootstrap zip file
+        # Start with a bare git dir.
         self.RunGit(['init', '--bare'], cwd=tempdir)
       else:
         # Bootstrap failed, previous cache exists; warn and continue.
         logging.warn(
-            'Git cache has a lot of pack files (%d).  Tried to re-bootstrap '
-            'but failed.  Continuing with non-optimized repository.'
+            'Git cache has a lot of pack files (%d). Tried to re-bootstrap '
+            'but failed. Continuing with non-optimized repository.'
             % len(pack_files))
         gclient_utils.rmtree(tempdir)
         tempdir = None
@@ -465,7 +514,8 @@ class Mirror(object):
     for spec in fetch_specs:
       try:
         self.print('Fetching %s' % spec)
-        self.RunGit(fetch_cmd + [spec], cwd=rundir, retry=True)
+        with self.print_duration_of('fetch %s' % spec):
+          self.RunGit(fetch_cmd + [spec], cwd=rundir, retry=True)
       except subprocess.CalledProcessError:
         if spec == '+refs/heads/*:refs/heads/*':
           raise ClobberNeeded()  # Corrupted cache.
@@ -493,7 +543,7 @@ class Mirror(object):
       self.print(GIT_CACHE_CORRUPT_MESSAGE)
       tempdir = self._ensure_bootstrapped(depth, bootstrap, force=True)
       assert tempdir
-      self._fetch(tempdir or self.mirror_path, verbose, depth)
+      self._fetch(tempdir, verbose, depth)
     finally:
       if tempdir:
         if os.path.exists(self.mirror_path):

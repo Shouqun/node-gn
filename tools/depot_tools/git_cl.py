@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright (c) 2012 The Chromium Authors. All rights reserved.
+# Copyright (c) 2013 The Chromium Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
@@ -14,16 +14,20 @@ from multiprocessing.pool import ThreadPool
 import base64
 import collections
 import contextlib
+import datetime
 import fnmatch
 import httplib
+import itertools
 import json
 import logging
 import multiprocessing
 import optparse
 import os
 import re
+import shutil
 import stat
 import sys
+import tempfile
 import textwrap
 import urllib
 import urllib2
@@ -56,6 +60,7 @@ import owners_finder
 import presubmit_support
 import rietveld
 import scm
+import split_cl
 import subcommand
 import subprocess2
 import watchlists
@@ -87,7 +92,7 @@ settings = None
 # Used by tests/git_cl_test.py to add extra logging.
 # Inside the weirdly failing test, add this:
 # >>> self.mock(git_cl, '_IS_BEING_TESTED', True)
-# And scroll up to see the strack trace printed.
+# And scroll up to see the stack trace printed.
 _IS_BEING_TESTED = False
 
 
@@ -145,7 +150,7 @@ def RunGitWithCode(args, suppress_stderr=False):
                                              stderr=stderr)
     return code, out
   except subprocess2.CalledProcessError as e:
-    logging.debug('Failed running %s', args)
+    logging.debug('Failed running %s', ['git'] + args)
     return e.returncode, e.stdout
 
 
@@ -181,6 +186,30 @@ def ask_for_data(prompt):
   except KeyboardInterrupt:
     # Hide the exception.
     sys.exit(1)
+
+
+def confirm_or_exit(prefix='', action='confirm'):
+  """Asks user to press enter to continue or press Ctrl+C to abort."""
+  if not prefix or prefix.endswith('\n'):
+    mid = 'Press'
+  elif prefix.endswith('.') or prefix.endswith('?'):
+    mid = ' Press'
+  elif prefix.endswith(' '):
+    mid = 'press'
+  else:
+    mid = ' press'
+  ask_for_data('%s%s Enter to %s, or Ctrl+C to abort' % (prefix, mid, action))
+
+
+def ask_for_explicit_yes(prompt):
+  """Returns whether user typed 'y' or 'yes' to confirm the given prompt"""
+  result = ask_for_data(prompt + ' [Yes/No]: ').lower()
+  while True:
+    if 'yes'.startswith(result):
+      return True
+    if 'no'.startswith(result):
+      return False
+    result = ask_for_data('Please, type yes or no: ').lower()
 
 
 def _git_branch_config_key(branch, key):
@@ -246,7 +275,7 @@ def _git_set_branch_config_value(key, value, branch=None, **kwargs):
 
 
 def _get_committer_timestamp(commit):
-  """Returns unix timestamp as integer of a committer in a commit.
+  """Returns Unix timestamp as integer of a committer in a commit.
 
   Commit can be whatever git show would recognize, such as HEAD, sha1 or ref.
   """
@@ -263,45 +292,6 @@ def _git_amend_head(message, committer_timestamp):
   env = os.environ.copy()
   env['GIT_COMMITTER_DATE'] = '%d+0000' % committer_timestamp
   return RunGit(['commit', '--amend', '-m', message], env=env)
-
-
-def add_git_similarity(parser):
-  parser.add_option(
-      '--similarity', metavar='SIM', type=int, action='store',
-      help='Sets the percentage that a pair of files need to match in order to'
-           ' be considered copies (default 50)')
-  parser.add_option(
-      '--find-copies', action='store_true',
-      help='Allows git to look for copies.')
-  parser.add_option(
-      '--no-find-copies', action='store_false', dest='find_copies',
-      help='Disallows git from looking for copies.')
-
-  old_parser_args = parser.parse_args
-  def Parse(args):
-    options, args = old_parser_args(args)
-
-    if options.similarity is None:
-      options.similarity = _git_get_branch_config_value(
-          'git-cl-similarity', default=50, value_type=int)
-    else:
-      print('Note: Saving similarity of %d%% in git config.'
-            % options.similarity)
-      _git_set_branch_config_value('git-cl-similarity', options.similarity)
-
-    options.similarity = max(0, min(options.similarity, 100))
-
-    if options.find_copies is None:
-      options.find_copies = _git_get_branch_config_value(
-          'git-find-copies', default=True, value_type=bool)
-    else:
-      _git_set_branch_config_value('git-find-copies', bool(options.find_copies))
-
-    print('Using %d%% similarity for rename/copy detection. '
-          'Override with --similarity.' % options.similarity)
-
-    return options, args
-  parser.parse_args = Parse
 
 
 def _get_properties_from_options(options):
@@ -430,20 +420,13 @@ def _get_bucket_map_for_builders(builders):
 
   bucket_map = {}
   for builder in builders:
-    masters = builders_map.get(builder, [])
-    if not masters:
-      return None, ('No matching master for builder %s.' % builder)
-    if len(masters) > 1:
-      return None, ('The builder name %s exists in multiple masters %s.' %
-                    (builder, masters))
-    bucket = _prefix_master(masters[0])
-    bucket_map.setdefault(bucket, {})[builder] = []
-
+    bucket = builders_map.get(builder, {}).get('bucket')
+    if bucket:
+      bucket_map.setdefault(bucket, {})[builder] = []
   return bucket_map, None
 
 
-def _trigger_try_jobs(auth_config, changelist, buckets, options,
-                      category='git_cl_try', patchset=None):
+def _trigger_try_jobs(auth_config, changelist, buckets, options, patchset):
   """Sends a request to Buildbucket to trigger try jobs for a changelist.
 
   Args:
@@ -472,8 +455,8 @@ def _trigger_try_jobs(auth_config, changelist, buckets, options,
       issue=changelist.GetIssue(),
       patch=patchset)
 
-  shared_parameters_properties = changelist.GetTryjobProperties(patchset)
-  shared_parameters_properties['category'] = category
+  shared_parameters_properties = changelist.GetTryJobProperties(patchset)
+  shared_parameters_properties['category'] = options.category
   if options.clobber:
     shared_parameters_properties['clobber'] = True
   extra_properties = _get_properties_from_options(options)
@@ -584,7 +567,7 @@ def fetch_try_jobs(auth_config, changelist, buildbucket_host,
 def print_try_jobs(options, builds):
   """Prints nicely result of fetch_try_jobs."""
   if not builds:
-    print('No try jobs scheduled')
+    print('No try jobs scheduled.')
     return
 
   # Make a copy, because we'll be modifying builds dictionary.
@@ -599,7 +582,7 @@ def print_try_jobs(options, builds):
         parameters = json.loads(b['parameters_json'])
         name = parameters['builder_name']
       except (ValueError, KeyError) as error:
-        print('WARNING: failed to get builder name for build %s: %s' % (
+        print('WARNING: Failed to get builder name for build %s: %s' % (
               b['id'], error))
         name = None
       builder_names_cache[b['id']] = name
@@ -688,14 +671,18 @@ def write_try_results_json(output_file, builds):
   """
 
   def convert_build_dict(build):
+    """Extracts some of the information from one build dict."""
+    parameters = json.loads(build.get('parameters_json', '{}')) or {}
     return {
         'buildbucket_id': build.get('id'),
-        'status': build.get('status'),
-        'result': build.get('result'),
         'bucket': build.get('bucket'),
-        'builder_name': json.loads(
-            build.get('parameters_json', '{}')).get('builder_name'),
+        'builder_name': parameters.get('builder_name'),
+        'created_ts': build.get('created_ts'),
+        'experimental': build.get('experimental'),
         'failure_reason': build.get('failure_reason'),
+        'result': build.get('result'),
+        'status': build.get('status'),
+        'tags': build.get('tags'),
         'url': build.get('url'),
     }
 
@@ -705,7 +692,7 @@ def write_try_results_json(output_file, builds):
   write_json(output_file, converted)
 
 
-def print_stats(similarity, find_copies, args):
+def print_stats(args):
   """Prints statistics about the change to the user."""
   # --no-ext-diff is broken in some versions of Git, so try to work around
   # this by overriding the environment (but there is still a problem if the
@@ -714,18 +701,12 @@ def print_stats(similarity, find_copies, args):
   if 'GIT_EXTERNAL_DIFF' in env:
     del env['GIT_EXTERNAL_DIFF']
 
-  if find_copies:
-    similarity_options = ['-l100000', '-C%s' % similarity]
-  else:
-    similarity_options = ['-M%s' % similarity]
-
   try:
     stdout = sys.stdout.fileno()
   except AttributeError:
     stdout = None
   return subprocess2.call(
-      ['git',
-       'diff', '--no-ext-diff', '--stat'] + similarity_options + args,
+      ['git', 'diff', '--no-ext-diff', '--stat', '-l100000', '-C50'] + args,
       stdout=stdout, env=env)
 
 
@@ -831,9 +812,10 @@ class Settings(object):
     return self._GetRietveldConfig('private', error_ok=True)
 
   def GetIsGerrit(self):
-    """Return true if this repo is assosiated with gerrit code review system."""
+    """Return true if this repo is associated with gerrit code review system."""
     if self.is_gerrit is None:
-      self.is_gerrit = self._GetConfig('gerrit.host', error_ok=True)
+      self.is_gerrit = (
+          self._GetConfig('gerrit.host', error_ok=True).lower() == 'true')
     return self.is_gerrit
 
   def GetSquashGerritUploads(self):
@@ -912,7 +894,7 @@ def _get_gerrit_project_config_file(remote_url):
       '+refs/meta/config:refs/git_cl/meta/config'])
   if error:
     # Ref doesn't exist or isn't accessible to current user.
-    print('WARNING: failed to fetch project config for %s: %s' %
+    print('WARNING: Failed to fetch project config for %s: %s' %
           (remote_url, error))
     yield None
     return
@@ -937,6 +919,9 @@ def _is_git_numberer_enabled(remote_url, remote_ref):
       'chromium/src',
       'external/webrtc',
       'v8/v8',
+      'infra/experimental',
+      # For webrtc.googlesource.com/src.
+      'src',
   ]
 
   assert remote_ref and remote_ref.startswith('refs/'), remote_ref
@@ -1010,34 +995,53 @@ class _CQState(object):
 
 
 class _ParsedIssueNumberArgument(object):
-  def __init__(self, issue=None, patchset=None, hostname=None):
+  def __init__(self, issue=None, patchset=None, hostname=None, codereview=None):
     self.issue = issue
     self.patchset = patchset
     self.hostname = hostname
+    assert codereview in (None, 'rietveld', 'gerrit')
+    self.codereview = codereview
 
   @property
   def valid(self):
     return self.issue is not None
 
 
-def ParseIssueNumberArgument(arg):
+def ParseIssueNumberArgument(arg, codereview=None):
   """Parses the issue argument and returns _ParsedIssueNumberArgument."""
   fail_result = _ParsedIssueNumberArgument()
 
   if arg.isdigit():
-    return _ParsedIssueNumberArgument(issue=int(arg))
+    return _ParsedIssueNumberArgument(issue=int(arg), codereview=codereview)
   if not arg.startswith('http'):
     return fail_result
+
   url = gclient_utils.UpgradeToHttps(arg)
   try:
     parsed_url = urlparse.urlparse(url)
   except ValueError:
     return fail_result
-  for cls in _CODEREVIEW_IMPLEMENTATIONS.itervalues():
-    tmp = cls.ParseIssueURL(parsed_url)
-    if tmp is not None:
-      return tmp
-  return fail_result
+
+  if codereview is not None:
+    parsed = _CODEREVIEW_IMPLEMENTATIONS[codereview].ParseIssueURL(parsed_url)
+    return parsed or fail_result
+
+  results = {}
+  for name, cls in _CODEREVIEW_IMPLEMENTATIONS.iteritems():
+    parsed = cls.ParseIssueURL(parsed_url)
+    if parsed is not None:
+      results[name] = parsed
+
+  if not results:
+    return fail_result
+  if len(results) == 1:
+    return results.values()[0]
+
+  if parsed_url.netloc and parsed_url.netloc.split('.')[0].endswith('-review'):
+    # This is likely Gerrit.
+    return results['gerrit']
+  # Choose Rietveld as before if URL can parsed by either.
+  return results['rietveld']
 
 
 class GerritChangeNotExists(Exception):
@@ -1049,6 +1053,12 @@ class GerritChangeNotExists(Exception):
   def __str__(self):
     return 'change %s at %s does not exist or you have no access to it' % (
         self.issue, self.url)
+
+
+_CommentSummary = collections.namedtuple(
+    '_CommentSummary', ['date', 'message', 'sender',
+                        # TODO(tandrii): these two aren't known in Gerrit.
+                        'approval', 'disapproval'])
 
 
 class Changelist(object):
@@ -1098,7 +1108,7 @@ class Changelist(object):
     self.lookedup_patchset = False
     self.patchset = None
     self.cc = None
-    self.watchers = ()
+    self.more_cc = []
     self._remote = None
 
     self._codereview_impl = None
@@ -1139,27 +1149,26 @@ class Changelist(object):
     return self._codereview == 'gerrit'
 
   def GetCCList(self):
-    """Return the users cc'd on this CL.
+    """Returns the users cc'd on this CL.
 
-    Return is a string suitable for passing to git cl with the --cc flag.
+    The return value is a string suitable for passing to git cl with the --cc
+    flag.
     """
     if self.cc is None:
       base_cc = settings.GetDefaultCCList()
-      more_cc = ','.join(self.watchers)
+      more_cc = ','.join(self.more_cc)
       self.cc = ','.join(filter(None, (base_cc, more_cc))) or ''
     return self.cc
 
   def GetCCListWithoutDefault(self):
     """Return the users cc'd on this CL excluding default ones."""
     if self.cc is None:
-      self.cc = ','.join(self.watchers)
+      self.cc = ','.join(self.more_cc)
     return self.cc
 
-  def SetWatchers(self, watchers):
-    """Set the list of email addresses that should be cc'd based on the changed
-       files in this CL.
-    """
-    self.watchers = watchers
+  def ExtendCC(self, more_cc):
+    """Extends the list of users to cc on this CL based on the changed files."""
+    self.more_cc.extend(more_cc)
 
   def GetBranch(self):
     """Returns the short branch name, e.g. 'master'."""
@@ -1281,10 +1290,10 @@ class Changelist(object):
 
     if upstream_git_obj is None:
       if self.GetBranch() is None:
-        print('ERROR: unable to determine current branch (detached HEAD?)',
+        print('ERROR: Unable to determine current branch (detached HEAD?)',
               file=sys.stderr)
       else:
-        print('ERROR: no upstream branch', file=sys.stderr)
+        print('ERROR: No upstream branch.', file=sys.stderr)
       return False
 
     # Verify the commit we're diffing against is in our current branch.
@@ -1358,7 +1367,7 @@ class Changelist(object):
   def GetDescription(self, pretty=False, force=False):
     if not self.has_description or force:
       if self.GetIssue():
-        self.description = self._codereview_impl.FetchDescription()
+        self.description = self._codereview_impl.FetchDescription(force=force)
       self.has_description = True
     if pretty:
       # Set width to 72 columns + 2 space indent.
@@ -1367,6 +1376,22 @@ class Changelist(object):
       lines = self.description.splitlines()
       return '\n'.join([wrapper.fill(line) for line in lines])
     return self.description
+
+  def GetDescriptionFooters(self):
+    """Returns (non_footer_lines, footers) for the commit message.
+
+    Returns:
+      non_footer_lines (list(str)) - Simple list of description lines without
+        any footer. The lines do not contain newlines, nor does the list contain
+        the empty line between the message and the footers.
+      footers (list(tuple(KEY, VALUE))) - List of parsed footers, e.g.
+        [("Change-Id", "Ideadbeef...."), ...]
+    """
+    raw_description = self.GetDescription()
+    msg_lines, _, footers = git_footers.split_footers(raw_description)
+    if footers:
+      msg_lines = msg_lines[:len(msg_lines)-1]
+    return msg_lines, footers
 
   def GetPatchset(self):
     """Returns the patchset number as a int or None if not set."""
@@ -1409,6 +1434,12 @@ class Changelist(object):
       ] + self._PostUnsetIssueProperties()
       for prop in reset_suffixes:
         self._GitSetBranchConfigValue(prop, None, error_ok=True)
+      msg = RunGit(['log', '-1', '--format=%B']).strip()
+      if msg and git_footers.get_footer_change_id(msg):
+        print('WARNING: The change patched into this branch has a Change-Id. '
+              'Removing it.')
+        RunGit(['commit', '--amend', '-m',
+                git_footers.remove_footer(msg, 'Change-Id')])
       self.issue = None
       self.patchset = None
 
@@ -1463,18 +1494,39 @@ class Changelist(object):
     self.description = description
     self.has_description = True
 
+  def UpdateDescriptionFooters(self, description_lines, footers, force=False):
+    """Sets the description for this CL remotely.
+
+    You can get description_lines and footers with GetDescriptionFooters.
+
+    Args:
+      description_lines (list(str)) - List of CL description lines without
+        newline characters.
+      footers (list(tuple(KEY, VALUE))) - List of footers, as returned by
+        GetDescriptionFooters. Key must conform to the git footers format (i.e.
+        `List-Of-Tokens`). It will be case-normalized so that each token is
+        title-cased.
+    """
+    new_description = '\n'.join(description_lines)
+    if footers:
+      new_description += '\n'
+      for k, v in footers:
+        foot = '%s: %s' % (git_footers.normalize_name(k), v)
+        if not git_footers.FOOTER_PATTERN.match(foot):
+          raise ValueError('Invalid footer %r' % foot)
+        new_description += foot + '\n'
+    self.UpdateDescription(new_description, force)
+
   def RunHook(self, committing, may_prompt, verbose, change):
     """Calls sys.exit() if the hook fails; returns a HookResults otherwise."""
     try:
       return presubmit_support.DoPresubmitChecks(change, committing,
           verbose=verbose, output_stream=sys.stdout, input_stream=sys.stdin,
           default_presubmit=None, may_prompt=may_prompt,
-          rietveld_obj=self._codereview_impl.GetRieveldObjForPresubmit(),
+          rietveld_obj=self._codereview_impl.GetRietveldObjForPresubmit(),
           gerrit_obj=self._codereview_impl.GetGerritObjForPresubmit())
     except presubmit_support.PresubmitFailure as e:
-      DieWithError(
-          ('%s\nMaybe your depot_tools is out of date?\n'
-           'If all fails, contact maruel@') % e)
+      DieWithError('%s\nMaybe your depot_tools is out of date?' % e)
 
   def CMDPatchIssue(self, issue_arg, reject, nocommit, directory):
     """Fetches and applies the issue patch from codereview to local branch."""
@@ -1488,13 +1540,13 @@ class Changelist(object):
       DieWithError('Failed to parse issue argument "%s". '
                    'Must be an issue number or a valid URL.' % issue_arg)
     return self._codereview_impl.CMDPatchWithParsedIssue(
-        parsed_issue_arg, reject, nocommit, directory)
+        parsed_issue_arg, reject, nocommit, directory, False)
 
   def CMDUpload(self, options, git_diff_args, orig_args):
     """Uploads a change to codereview."""
+    custom_cl_base = None
     if git_diff_args:
-      # TODO(ukai): is it ok for gerrit case?
-      base_branch = git_diff_args[0]
+      custom_cl_base = base_branch = git_diff_args[0]
     else:
       if self.GetBranch() is None:
         DieWithError('Can\'t upload from detached HEAD state. Get on a branch!')
@@ -1503,24 +1555,36 @@ class Changelist(object):
       base_branch = self.GetCommonAncestorWithUpstream()
       git_diff_args = [base_branch, 'HEAD']
 
-    # Make sure authenticated to codereview before running potentially expensive
-    # hooks.  It is a fast, best efforts check. Codereview still can reject the
-    # authentication during the actual upload.
+    # Warn about Rietveld deprecation for initial uploads to Rietveld.
+    if not self.IsGerrit() and not self.GetIssue():
+      print('=====================================')
+      print('NOTICE: Rietveld is being deprecated. '
+            'You can upload changes to Gerrit with')
+      print('  git cl upload --gerrit')
+      print('or set Gerrit to be your default code review tool with')
+      print('  git config gerrit.host true')
+      print('=====================================')
+
+    # Fast best-effort checks to abort before running potentially
+    # expensive hooks if uploading is likely to fail anyway. Passing these
+    # checks does not guarantee that uploading will not fail.
     self._codereview_impl.EnsureAuthenticated(force=options.force)
+    self._codereview_impl.EnsureCanUploadPatchset(force=options.force)
 
     # Apply watchlists on upload.
     change = self.GetChange(base_branch, None)
     watchlist = watchlists.Watchlists(change.RepositoryRoot())
     files = [f.LocalPath() for f in change.AffectedFiles()]
     if not options.bypass_watchlists:
-      self.SetWatchers(watchlist.GetWatchersForPaths(files))
+      self.ExtendCC(watchlist.GetWatchersForPaths(files))
 
     if not options.bypass_hooks:
-      if options.reviewers or options.tbr_owners:
+      if options.reviewers or options.tbrs or options.add_owners_to:
         # Set the reviewer list now so that presubmit checks can access it.
         change_description = ChangeDescription(change.FullDescriptionText())
         change_description.update_reviewers(options.reviewers,
-                                            options.tbr_owners,
+                                            options.tbrs,
+                                            options.add_owners_to,
                                             change)
         change.SetDescriptionText(change_description.description)
       hook_results = self.RunHook(committing=False,
@@ -1531,6 +1595,7 @@ class Changelist(object):
         return 1
       if not options.reviewers and hook_results.reviewers:
         options.reviewers = hook_results.reviewers.split(',')
+      self.ExtendCC(hook_results.more_cc)
 
     # TODO(tandrii): Checking local patchset against remote patchset is only
     # supported for Rietveld. Extend it to Gerrit or remove it completely.
@@ -1545,10 +1610,10 @@ class Changelist(object):
         print('Uploading will still work, but if you\'ve uploaded to this '
               'issue from another machine or branch the patch you\'re '
               'uploading now might not include those changes.')
-        ask_for_data('About to upload; enter to confirm.')
+        confirm_or_exit(action='upload')
 
-    print_stats(options.similarity, options.find_copies, git_diff_args)
-    ret = self.CMDUploadChange(options, git_diff_args, change)
+    print_stats(git_diff_args)
+    ret = self.CMDUploadChange(options, git_diff_args, custom_cl_base, change)
     if not ret:
       if options.use_commit_queue:
         self.SetCQState(_CQState.COMMIT)
@@ -1579,40 +1644,42 @@ class Changelist(object):
     return ret
 
   def SetCQState(self, new_state):
-    """Update the CQ state for latest patchset.
+    """Updates the CQ state for the latest patchset.
 
     Issue must have been already uploaded and known.
     """
     assert new_state in _CQState.ALL_STATES
     assert self.GetIssue()
-    return self._codereview_impl.SetCQState(new_state)
-
-  def TriggerDryRun(self):
-    """Triggers a dry run and prints a warning on failure."""
-    # TODO(qyearsley): Either re-use this method in CMDset_commit
-    # and CMDupload, or change CMDtry to trigger dry runs with
-    # just SetCQState, and catch keyboard interrupt and other
-    # errors in that method.
     try:
-      self.SetCQState(_CQState.DRY_RUN)
-      print('scheduled CQ Dry Run on %s' % self.GetIssueURL())
+      self._codereview_impl.SetCQState(new_state)
       return 0
     except KeyboardInterrupt:
       raise
     except:
-      print('WARNING: failed to trigger CQ Dry Run.\n'
+      print('WARNING: Failed to %s.\n'
             'Either:\n'
-            ' * your project has no CQ\n'
-            ' * you don\'t have permission to trigger Dry Run\n'
-            ' * bug in this code (see stack trace below).\n'
-            'Consider specifying which bots to trigger manually '
-            'or asking your project owners for permissions '
-            'or contacting Chrome Infrastructure team at '
-            'https://www.chromium.org/infra\n\n')
+            ' * Your project has no CQ,\n'
+            ' * You don\'t have permission to change the CQ state,\n'
+            ' * There\'s a bug in this code (see stack trace below).\n'
+            'Consider specifying which bots to trigger manually or asking your '
+            'project owners for permissions or contacting Chrome Infra at:\n'
+            'https://www.chromium.org/infra\n\n' %
+            ('cancel CQ' if new_state == _CQState.NONE else 'trigger CQ'))
       # Still raise exception so that stack trace is printed.
       raise
 
   # Forward methods to codereview specific implementation.
+
+  def AddComment(self, message, publish=None):
+    return self._codereview_impl.AddComment(message, publish=publish)
+
+  def GetCommentsSummary(self, readable=True):
+    """Returns list of _CommentSummary for each comment.
+
+    args:
+    readable: determines whether the output is designed for a human or a machine
+    """
+    return self._codereview_impl.GetCommentsSummary(readable)
 
   def CloseIssue(self):
     return self._codereview_impl.CloseIssue()
@@ -1627,19 +1694,19 @@ class Changelist(object):
     """Get owner from codereview, which may differ from this checkout."""
     return self._codereview_impl.GetIssueOwner()
 
-  def GetApprovingReviewers(self):
-    return self._codereview_impl.GetApprovingReviewers()
+  def GetReviewers(self):
+    return self._codereview_impl.GetReviewers()
 
   def GetMostRecentPatchset(self):
     return self._codereview_impl.GetMostRecentPatchset()
 
   def CannotTriggerTryJobReason(self):
-    """Returns reason (str) if unable trigger tryjobs on this CL or None."""
+    """Returns reason (str) if unable trigger try jobs on this CL or None."""
     return self._codereview_impl.CannotTriggerTryJobReason()
 
-  def GetTryjobProperties(self, patchset=None):
-    """Returns dictionary of properties to launch tryjob."""
-    return self._codereview_impl.GetTryjobProperties(patchset=patchset)
+  def GetTryJobProperties(self, patchset=None):
+    """Returns dictionary of properties to launch try job."""
+    return self._codereview_impl.GetTryJobProperties(patchset=patchset)
 
   def __getattr__(self, attr):
     # This is because lots of untested code accesses Rietveld-specific stuff
@@ -1676,7 +1743,7 @@ class _ChangelistCodereviewBase(object):
     """Returns server URL without end slash, like "https://codereview.com"."""
     raise NotImplementedError()
 
-  def FetchDescription(self):
+  def FetchDescription(self, force=False):
     """Fetches and returns description from the codereview server."""
     raise NotImplementedError()
 
@@ -1696,12 +1763,12 @@ class _ChangelistCodereviewBase(object):
     raise NotImplementedError()
 
   def _PostUnsetIssueProperties(self):
-    """Which branch-specific properties to erase when unsettin issue."""
+    """Which branch-specific properties to erase when unsetting issue."""
     return []
 
-  def GetRieveldObjForPresubmit(self):
+  def GetRietveldObjForPresubmit(self):
     # This is an unfortunate Rietveld-embeddedness in presubmit.
-    # For non-Rietveld codereviews, this probably should return a dummy object.
+    # For non-Rietveld code reviews, this probably should return a dummy object.
     raise NotImplementedError()
 
   def GetGerritObjForPresubmit(self):
@@ -1712,15 +1779,15 @@ class _ChangelistCodereviewBase(object):
     """Update the description on codereview site."""
     raise NotImplementedError()
 
-  def CloseIssue(self):
-    """Closes the issue."""
+  def AddComment(self, message, publish=None):
+    """Posts a comment to the codereview site."""
     raise NotImplementedError()
 
-  def GetApprovingReviewers(self):
-    """Returns a list of reviewers approving the change.
+  def GetCommentsSummary(self, readable=True):
+    raise NotImplementedError()
 
-    Note: not necessarily committers.
-    """
+  def CloseIssue(self):
+    """Closes the issue."""
     raise NotImplementedError()
 
   def GetMostRecentPatchset(self):
@@ -1728,7 +1795,7 @@ class _ChangelistCodereviewBase(object):
     raise NotImplementedError()
 
   def CMDPatchWithParsedIssue(self, parsed_issue_arg, reject, nocommit,
-                              directory):
+                              directory, force):
     """Fetches and applies the issue.
 
     Arguments:
@@ -1738,6 +1805,7 @@ class _ChangelistCodereviewBase(object):
       nocommit: do not commit the patch, thus leave the tree dirty. Rietveld
         only.
       directory: switch to directory before applying the patch. Rietveld only.
+      force: if true, overwrites existing local state.
     """
     raise NotImplementedError()
 
@@ -1757,29 +1825,45 @@ class _ChangelistCodereviewBase(object):
     """
     raise NotImplementedError()
 
-  def CMDUploadChange(self, options, args, change):
+  def EnsureCanUploadPatchset(self, force):
+    """Best effort check that uploading isn't supposed to fail for predictable
+    reasons.
+
+    This method should raise informative exception if uploading shouldn't
+    proceed.
+
+    Arguments:
+      force: whether to skip confirmation questions.
+    """
+    raise NotImplementedError()
+
+  def CMDUploadChange(self, options, git_diff_args, custom_cl_base, change):
     """Uploads a change to codereview."""
     raise NotImplementedError()
 
   def SetCQState(self, new_state):
-    """Update the CQ state for latest patchset.
+    """Updates the CQ state for the latest patchset.
 
     Issue must have been already uploaded and known.
     """
     raise NotImplementedError()
 
   def CannotTriggerTryJobReason(self):
-    """Returns reason (str) if unable trigger tryjobs on this CL or None."""
+    """Returns reason (str) if unable trigger try jobs on this CL or None."""
     raise NotImplementedError()
 
   def GetIssueOwner(self):
     raise NotImplementedError()
 
-  def GetTryjobProperties(self, patchset=None):
+  def GetReviewers(self):
+    raise NotImplementedError()
+
+  def GetTryJobProperties(self, patchset=None):
     raise NotImplementedError()
 
 
 class _RietveldChangelistImpl(_ChangelistCodereviewBase):
+
   def __init__(self, changelist, auth_config=None, codereview_host=None):
     super(_RietveldChangelistImpl, self).__init__(changelist)
     assert settings, 'must be initialized in _ChangelistCodereviewBase'
@@ -1812,11 +1896,15 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
       if refresh:
         authenticator.get_access_token()
 
-  def FetchDescription(self):
+  def EnsureCanUploadPatchset(self, force):
+    # No checks for Rietveld because we are deprecating Rietveld.
+    pass
+
+  def FetchDescription(self, force=False):
     issue = self.GetIssue()
     assert issue
     try:
-      return self.RpcServer().get_description(issue).strip()
+      return self.RpcServer().get_description(issue, force=force).strip()
     except urllib2.HTTPError as e:
       if e.code == 404:
         DieWithError(
@@ -1858,8 +1946,8 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
       return 'CL %s is private' % self.GetIssue()
     return None
 
-  def GetTryjobProperties(self, patchset=None):
-    """Returns dictionary of properties to launch tryjob."""
+  def GetTryJobProperties(self, patchset=None):
+    """Returns dictionary of properties to launch try job."""
     project = (self.GetIssueProperties() or {}).get('project')
     return {
       'issue': self.GetIssue(),
@@ -1869,27 +1957,41 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
       'rietveld': self.GetCodereviewServer(),
     }
 
-  def GetApprovingReviewers(self):
-    return get_approving_reviewers(self.GetIssueProperties())
-
   def GetIssueOwner(self):
     return (self.GetIssueProperties() or {}).get('owner_email')
 
-  def AddComment(self, message):
+  def GetReviewers(self):
+    return (self.GetIssueProperties() or {}).get('reviewers')
+
+  def AddComment(self, message, publish=None):
     return self.RpcServer().add_comment(self.GetIssue(), message)
 
+  def GetCommentsSummary(self, _readable=True):
+    summary = []
+    for message in self.GetIssueProperties().get('messages', []):
+      date = datetime.datetime.strptime(message['date'], '%Y-%m-%d %H:%M:%S.%f')
+      summary.append(_CommentSummary(
+        date=date,
+        disapproval=bool(message['disapproval']),
+        approval=bool(message['approval']),
+        sender=message['sender'],
+        message=message['text'],
+      ))
+    return summary
+
   def GetStatus(self):
-    """Apply a rough heuristic to give a simple summary of an issue's review
+    """Applies a rough heuristic to give a simple summary of an issue's review
     or CQ status, assuming adherence to a common workflow.
 
     Returns None if no issue for this branch, or one of the following keywords:
-      * 'error'   - error from review tool (including deleted issues)
-      * 'unsent'  - not sent for review
-      * 'waiting' - waiting for review
-      * 'reply'   - waiting for owner to reply to review
-      * 'lgtm'    - LGTM from at least one approved reviewer
-      * 'commit'  - in the commit queue
-      * 'closed'  - closed
+      * 'error'    - error from review tool (including deleted issues)
+      * 'unsent'   - not sent for review
+      * 'waiting'  - waiting for review
+      * 'reply'    - waiting for owner to reply to review
+      * 'not lgtm' - Code-Review label has been set negatively
+      * 'lgtm'     - LGTM from at least one approved reviewer
+      * 'commit'   - in the commit queue
+      * 'closed'   - closed
     """
     if not self.GetIssue():
       return None
@@ -1906,16 +2008,15 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
       # Issue is in the commit queue.
       return 'commit'
 
-    try:
-      reviewers = self.GetApprovingReviewers()
-    except urllib2.HTTPError:
-      return 'error'
-
-    if reviewers:
-      # Was LGTM'ed.
-      return 'lgtm'
-
     messages = props.get('messages') or []
+    if not messages:
+      # No message was sent.
+      return 'unsent'
+
+    if get_approving_reviewers(props):
+      return 'lgtm'
+    elif get_approving_reviewers(props, disapproval=True):
+      return 'not lgtm'
 
     # Skip CQ messages that don't require owner's action.
     while messages and messages[-1]['sender'] == COMMIT_BOT_EMAIL:
@@ -1929,9 +2030,6 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
         # This is probably a CQ messages warranting user attention.
         break
 
-    if not messages:
-      # No message was sent.
-      return 'unsent'
     if messages[-1]['sender'] != props.get('owner_email'):
       # Non-LGTM reply from non-owner and not CQ bot.
       return 'reply'
@@ -1983,7 +2081,7 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
   def CodereviewServerConfigKey(cls):
     return 'rietveldserver'
 
-  def GetRieveldObjForPresubmit(self):
+  def GetRietveldObjForPresubmit(self):
     return self.RpcServer()
 
   def SetCQState(self, new_state):
@@ -2000,7 +2098,7 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
       self.SetFlags({'commit': '1', 'cq_dry_run': '1'})
 
   def CMDPatchWithParsedIssue(self, parsed_issue_arg, reject, nocommit,
-                              directory):
+                              directory, force):
     # PatchIssue should never be called with a dirty tree.  It is up to the
     # caller to check this, but just in case we assert here since the
     # consequences of the caller not checking this could be dire.
@@ -2021,12 +2119,12 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
 
     # If we had an issue, commit the current state and register the issue.
     if not nocommit:
+      self.SetIssue(self.GetIssue())
+      self.SetPatchset(patchset)
       RunGit(['commit', '-m', (self.GetDescription() + '\n\n' +
                                'patch from issue %(i)s at patchset '
                                '%(p)s (http://crrev.com/%(i)s#ps%(p)s)'
                                % {'i': self.GetIssue(), 'p': patchset})])
-      self.SetIssue(self.GetIssue())
-      self.SetPatchset(patchset)
       print('Committed patch locally.')
     else:
       print('Patch applied to index.')
@@ -2043,23 +2141,26 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
       return _ParsedIssueNumberArgument(
           issue=int(match.group(1)),
           patchset=int(match2.group(1)),
-          hostname=parsed_url.netloc)
+          hostname=parsed_url.netloc,
+          codereview='rietveld')
     # Typical url: https://domain/<issue_number>[/[other]]
     match = re.match('/(\d+)(/.*)?$', parsed_url.path)
     if match:
       return _ParsedIssueNumberArgument(
           issue=int(match.group(1)),
-          hostname=parsed_url.netloc)
+          hostname=parsed_url.netloc,
+          codereview='rietveld')
     # Rietveld patch: https://domain/download/issue<number>_<patchset>.diff
     match = re.match(r'/download/issue(\d+)_(\d+).diff$', parsed_url.path)
     if match:
       return _ParsedIssueNumberArgument(
           issue=int(match.group(1)),
           patchset=int(match.group(2)),
-          hostname=parsed_url.netloc)
+          hostname=parsed_url.netloc,
+          codereview='rietveld')
     return None
 
-  def CMDUploadChange(self, options, args, change):
+  def CMDUploadChange(self, options, args, custom_cl_base, change):
     """Upload the patch to Rietveld."""
     upload_args = ['--assume_yes']  # Don't ask about untracked files.
     upload_args.extend(['--server', self.GetCodereviewServer()])
@@ -2090,12 +2191,11 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
         if options.title:
           message = options.title + '\n\n' + message
       change_desc = ChangeDescription(message)
-      if options.reviewers or options.tbr_owners:
-        change_desc.update_reviewers(options.reviewers,
-                                     options.tbr_owners,
-                                     change)
+      if options.reviewers or options.add_owners_to:
+        change_desc.update_reviewers(options.reviewers, options.tbrs,
+                                     options.add_owners_to, change)
       if not options.force:
-        change_desc.prompt(bug=options.bug)
+        change_desc.prompt(bug=options.bug, git_footer=False)
 
       if not change_desc.description:
         print('Description is empty; aborting.')
@@ -2128,10 +2228,6 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
 
     if options.private or settings.GetDefaultPrivateFlag() == "True":
       upload_args.append('--private')
-
-    upload_args.extend(['--git_similarity', str(options.similarity)])
-    if not options.find_copies:
-      upload_args.extend(['--git_no_find_copies'])
 
     # Include the upstream repo's URL in the change -- this is useful for
     # projects that have their source spread across multiple repos.
@@ -2179,6 +2275,11 @@ class _RietveldChangelistImpl(_ChangelistCodereviewBase):
     project = settings.GetProject()
     if project:
       upload_args.extend(['--project', project])
+    else:
+      print()
+      print('WARNING: Uploading without a project specified. Please ensure '
+            'your repo\'s codereview.settings has a "PROJECT: foo" line.')
+      print()
 
     try:
       upload_args = ['upload'] + upload_args + args
@@ -2225,7 +2326,7 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
       # This happens for internal stuff http://crbug.com/614312.
       parsed = urlparse.urlparse(self.GetRemoteUrl())
       if parsed.scheme == 'sso':
-        print('WARNING: using non https URLs for remote is likely broken\n'
+        print('WARNING: using non-https URLs for remote is likely broken\n'
               '  Your current remote is: %s'  % self.GetRemoteUrl())
         self._gerrit_host = '%s.googlesource.com' % self._gerrit_host
         self._gerrit_server = 'https://%s' % self._gerrit_host
@@ -2284,23 +2385,25 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
     if gerrit_auth and git_auth:
       if gerrit_auth == git_auth:
         return
+      all_gsrc = cookie_auth.get_auth_header('d0esN0tEx1st.googlesource.com')
       print((
-          'WARNING: you have different credentials for Gerrit and git hosts.\n'
-          '         Check your %s or %s file for credentials of hosts:\n'
+          'WARNING: You have different credentials for Gerrit and git hosts:\n'
           '           %s\n'
           '           %s\n'
-          '         %s') %
-          (cookie_auth.get_gitcookies_path(), cookie_auth.get_netrc_path(),
-           git_host, self._gerrit_host,
+          '        Consider running the following command:\n'
+          '          git cl creds-check\n'
+          '        %s\n'
+          '        %s') %
+          (git_host, self._gerrit_host,
+           ('Hint: delete creds for .googlesource.com' if all_gsrc else ''),
            cookie_auth.get_new_password_message(git_host)))
       if not force:
-        ask_for_data('If you know what you are doing, press Enter to continue, '
-                     'Ctrl+C to abort.')
+        confirm_or_exit('If you know what you are doing', action='continue')
       return
     else:
       missing = (
-          [] if gerrit_auth else [self._gerrit_host] +
-          [] if git_auth else [git_host])
+          ([] if gerrit_auth else [self._gerrit_host]) +
+          ([] if git_auth else [git_host]))
       DieWithError('Credentials for the following hosts are required:\n'
                    '  %s\n'
                    'These are read from %s (or legacy %s)\n'
@@ -2310,11 +2413,47 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
                      cookie_auth.get_netrc_path(),
                      cookie_auth.get_new_password_message(git_host)))
 
+  def EnsureCanUploadPatchset(self, force):
+    if not self.GetIssue():
+      return
+
+    # Warm change details cache now to avoid RPCs later, reducing latency for
+    # developers.
+    self._GetChangeDetail(
+        ['DETAILED_ACCOUNTS', 'CURRENT_REVISION', 'CURRENT_COMMIT'])
+
+    status = self._GetChangeDetail()['status']
+    if status in ('MERGED', 'ABANDONED'):
+      DieWithError('Change %s has been %s, new uploads are not allowed' %
+                   (self.GetIssueURL(),
+                    'submitted' if status == 'MERGED' else 'abandoned'))
+
+    if gerrit_util.GceAuthenticator.is_gce():
+      return
+    cookies_user = gerrit_util.CookiesAuthenticator().get_auth_email(
+        self._GetGerritHost())
+    if self.GetIssueOwner() == cookies_user:
+      return
+    logging.debug('change %s owner is %s, cookies user is %s',
+                  self.GetIssue(), self.GetIssueOwner(), cookies_user)
+    # Maybe user has linked accounts or something like that,
+    # so ask what Gerrit thinks of this user.
+    details = gerrit_util.GetAccountDetails(self._GetGerritHost(), 'self')
+    if details['email'] == self.GetIssueOwner():
+      return
+    if not force:
+      print('WARNING: Change %s is owned by %s, but you authenticate to Gerrit '
+            'as %s.\n'
+            'Uploading may fail due to lack of permissions.' %
+            (self.GetIssue(), self.GetIssueOwner(), details['email']))
+      confirm_or_exit(action='upload')
+
+
   def _PostUnsetIssueProperties(self):
     """Which branch-specific properties to erase when unsetting issue."""
     return ['gerritsquashhash']
 
-  def GetRieveldObjForPresubmit(self):
+  def GetRietveldObjForPresubmit(self):
     class ThisIsNotRietveldIssue(object):
       def __nonzero__(self):
         # This is a hack to make presubmit_support think that rietveld is not
@@ -2326,7 +2465,7 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
         print(
             'You aren\'t using Rietveld at the moment, but Gerrit.\n'
             'Using Rietveld in your PRESUBMIT scripts won\'t work.\n'
-            'Please, either change your PRESUBIT to not use rietveld_obj.%s,\n'
+            'Please, either change your PRESUBMIT to not use rietveld_obj.%s,\n'
             'or use Rietveld for codereview.\n'
             'See also http://crbug.com/579160.' % attr)
         raise NotImplementedError()
@@ -2340,95 +2479,156 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
     or CQ status, assuming adherence to a common workflow.
 
     Returns None if no issue for this branch, or one of the following keywords:
-      * 'error'    - error from review tool (including deleted issues)
-      * 'unsent'   - no reviewers added
-      * 'waiting'  - waiting for review
-      * 'reply'    - waiting for owner to reply to review
-      * 'not lgtm' - Code-Review disapproval from at least one valid reviewer
-      * 'lgtm'     - Code-Review approval from at least one valid reviewer
-      * 'commit'   - in the commit queue
-      * 'closed'   - abandoned
+      * 'error'   - error from review tool (including deleted issues)
+      * 'unsent'  - no reviewers added
+      * 'waiting' - waiting for review
+      * 'reply'   - waiting for uploader to reply to review
+      * 'lgtm'    - Code-Review label has been set
+      * 'commit'  - in the commit queue
+      * 'closed'  - successfully submitted or abandoned
     """
     if not self.GetIssue():
       return None
 
     try:
-      data = self._GetChangeDetail(['DETAILED_LABELS', 'CURRENT_REVISION'])
+      data = self._GetChangeDetail([
+          'DETAILED_LABELS', 'CURRENT_REVISION', 'SUBMITTABLE'])
     except (httplib.HTTPException, GerritChangeNotExists):
       return 'error'
 
     if data['status'] in ('ABANDONED', 'MERGED'):
       return 'closed'
 
-    cq_label = data['labels'].get('Commit-Queue', {})
-    if cq_label:
-      votes = cq_label.get('all', [])
-      highest_vote = 0
-      for v in votes:
-        highest_vote = max(highest_vote, v.get('value', 0))
-      vote_value = str(highest_vote)
-      if vote_value != '0':
-        # Add a '+' if the value is not 0 to match the values in the label.
-        # The cq_label does not have negatives.
-        vote_value = '+' + vote_value
-      vote_text = cq_label.get('values', {}).get(vote_value, '')
-      if vote_text.lower() == 'commit':
-        return 'commit'
+    if data['labels'].get('Commit-Queue', {}).get('approved'):
+      # The section will have an "approved" subsection if anyone has voted
+      # the maximum value on the label.
+      return 'commit'
 
-    lgtm_label = data['labels'].get('Code-Review', {})
-    if lgtm_label:
-      if 'rejected' in lgtm_label:
-        return 'not lgtm'
-      if 'approved' in lgtm_label:
-        return 'lgtm'
+    if data['labels'].get('Code-Review', {}).get('approved'):
+      return 'lgtm'
 
     if not data.get('reviewers', {}).get('REVIEWER', []):
       return 'unsent'
 
-    messages = data.get('messages', [])
     owner = data['owner'].get('_account_id')
-    while messages:
-      last_message_author = messages.pop().get('author', {})
+    messages = sorted(data.get('messages', []), key=lambda m: m.get('updated'))
+    last_message_author = messages.pop().get('author', {})
+    while last_message_author:
       if last_message_author.get('email') == COMMIT_BOT_EMAIL:
         # Ignore replies from CQ.
+        last_message_author = messages.pop().get('author', {})
         continue
-      if last_message_author.get('_account_id') != owner:
+      if last_message_author.get('_account_id') == owner:
+        # Most recent message was by owner.
+        return 'waiting'
+      else:
         # Some reply from non-owner.
         return 'reply'
-    return 'waiting'
+
+    # Somehow there are no messages even though there are reviewers.
+    return 'unsent'
 
   def GetMostRecentPatchset(self):
     data = self._GetChangeDetail(['CURRENT_REVISION'])
-    return data['revisions'][data['current_revision']]['_number']
+    patchset = data['revisions'][data['current_revision']]['_number']
+    self.SetPatchset(patchset)
+    return patchset
 
-  def FetchDescription(self):
-    data = self._GetChangeDetail(['CURRENT_REVISION', 'CURRENT_COMMIT'])
+  def FetchDescription(self, force=False):
+    data = self._GetChangeDetail(['CURRENT_REVISION', 'CURRENT_COMMIT'],
+                                 no_cache=force)
     current_rev = data['current_revision']
     return data['revisions'][current_rev]['commit']['message']
 
   def UpdateDescriptionRemote(self, description, force=False):
     if gerrit_util.HasPendingChangeEdit(self._GetGerritHost(), self.GetIssue()):
       if not force:
-        ask_for_data(
+        confirm_or_exit(
             'The description cannot be modified while the issue has a pending '
-            'unpublished edit.  Either publish the edit in the Gerrit web UI '
-            'or delete it.\n\n'
-            'Press Enter to delete the unpublished edit, Ctrl+C to abort.')
+            'unpublished edit. Either publish the edit in the Gerrit web UI '
+            'or delete it.\n\n', action='delete the unpublished edit')
 
       gerrit_util.DeletePendingChangeEdit(self._GetGerritHost(),
                                           self.GetIssue())
     gerrit_util.SetCommitMessage(self._GetGerritHost(), self.GetIssue(),
                                  description, notify='NONE')
 
+  def AddComment(self, message, publish=None):
+    gerrit_util.SetReview(self._GetGerritHost(), self.GetIssue(),
+                          msg=message, ready=publish)
+
+  def GetCommentsSummary(self, readable=True):
+    # DETAILED_ACCOUNTS is to get emails in accounts.
+    messages = self._GetChangeDetail(
+        options=['MESSAGES', 'DETAILED_ACCOUNTS']).get('messages', [])
+    file_comments = gerrit_util.GetChangeComments(
+        self._GetGerritHost(), self.GetIssue())
+
+    # Build dictionary of file comments for easy access and sorting later.
+    # {author+date: {path: {patchset: {line: url+message}}}}
+    comments = collections.defaultdict(
+        lambda: collections.defaultdict(lambda: collections.defaultdict(dict)))
+    for path, line_comments in file_comments.iteritems():
+      for comment in line_comments:
+        if comment.get('tag', '').startswith('autogenerated'):
+          continue
+        key = (comment['author']['email'], comment['updated'])
+        if comment.get('side', 'REVISION') == 'PARENT':
+          patchset = 'Base'
+        else:
+          patchset = 'PS%d' % comment['patch_set']
+        line = comment.get('line', 0)
+        url = ('https://%s/c/%s/%s/%s#%s%s' %
+            (self._GetGerritHost(), self.GetIssue(), comment['patch_set'], path,
+             'b' if comment.get('side') == 'PARENT' else '',
+             str(line) if line else ''))
+        comments[key][path][patchset][line] = (url, comment['message'])
+
+    summary = []
+    for msg in messages:
+      # Don't bother showing autogenerated messages.
+      if msg.get('tag') and msg.get('tag').startswith('autogenerated'):
+        continue
+      # Gerrit spits out nanoseconds.
+      assert len(msg['date'].split('.')[-1]) == 9
+      date = datetime.datetime.strptime(msg['date'][:-3],
+                                        '%Y-%m-%d %H:%M:%S.%f')
+      message = msg['message']
+      key = (msg['author']['email'], msg['date'])
+      if key in comments:
+        message += '\n'
+      for path, patchsets in sorted(comments.get(key, {}).items()):
+        if readable:
+          message += '\n%s' % path
+        for patchset, lines in sorted(patchsets.items()):
+          for line, (url, content) in sorted(lines.items()):
+            if line:
+              line_str = 'Line %d' % line
+              path_str = '%s:%d:' % (path, line)
+            else:
+              line_str = 'File comment'
+              path_str = '%s:0:' % path
+            if readable:
+              message += '\n  %s, %s: %s' % (patchset, line_str, url)
+              message += '\n  %s\n' % content
+            else:
+              message += '\n%s ' % path_str
+              message += '\n%s\n' % content
+
+      summary.append(_CommentSummary(
+        date=date,
+        message=message,
+        sender=msg['author']['email'],
+        # These could be inferred from the text messages and correlated with
+        # Code-Review label maximum, however this is not reliable.
+        # Leaving as is until the need arises.
+        approval=False,
+        disapproval=False,
+      ))
+    return summary
+
   def CloseIssue(self):
     gerrit_util.AbandonChange(self._GetGerritHost(), self.GetIssue(), msg='')
-
-  def GetApprovingReviewers(self):
-    """Returns a list of reviewers approving the change.
-
-    Note: not necessarily committers.
-    """
-    raise NotImplementedError()
 
   def SubmitIssue(self, wait_for_merge=True):
     gerrit_util.SubmitChange(self._GetGerritHost(), self.GetIssue(),
@@ -2470,8 +2670,8 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
           return data
 
     try:
-      data = gerrit_util.GetChangeDetail(self._GetGerritHost(), str(issue),
-                                         options, ignore_404=False)
+      data = gerrit_util.GetChangeDetail(
+          self._GetGerritHost(), str(issue), options)
     except gerrit_util.GerritError as e:
       if e.http_status == 404:
         raise GerritChangeNotExists(issue, self.GetCodereviewServer())
@@ -2483,9 +2683,12 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
   def _GetChangeCommit(self, issue=None):
     issue = issue or self.GetIssue()
     assert issue, 'issue is required to query Gerrit'
-    data = gerrit_util.GetChangeCommit(self._GetGerritHost(), str(issue))
-    if not data:
-      raise GerritChangeNotExists(issue, self.GetCodereviewServer())
+    try:
+      data = gerrit_util.GetChangeCommit(self._GetGerritHost(), str(issue))
+    except gerrit_util.GerritError as e:
+      if e.http_status == 404:
+        raise GerritChangeNotExists(issue, self.GetCodereviewServer())
+      raise
     return data
 
   def CMDLand(self, force, bypass_hooks, verbose):
@@ -2494,28 +2697,28 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
     detail = self._GetChangeDetail(['CURRENT_REVISION', 'LABELS'])
     if u'Commit-Queue' in detail.get('labels', {}):
       if not force:
-        ask_for_data('\nIt seems this repository has a Commit Queue, '
-                     'which can test and land changes for you. '
-                     'Are you sure you wish to bypass it?\n'
-                     'Press Enter to continue, Ctrl+C to abort.')
+        confirm_or_exit('\nIt seems this repository has a Commit Queue, '
+                        'which can test and land changes for you. '
+                        'Are you sure you wish to bypass it?\n',
+                        action='bypass CQ')
 
     differs = True
     last_upload = self._GitGetBranchConfigValue('gerritsquashhash')
     # Note: git diff outputs nothing if there is no diff.
     if not last_upload or RunGit(['diff', last_upload]).strip():
-      print('WARNING: some changes from local branch haven\'t been uploaded')
+      print('WARNING: Some changes from local branch haven\'t been uploaded.')
     else:
       if detail['current_revision'] == last_upload:
         differs = False
       else:
-        print('WARNING: local branch contents differ from latest uploaded '
-              'patchset')
+        print('WARNING: Local branch contents differ from latest uploaded '
+              'patchset.')
     if differs:
       if not force:
-        ask_for_data(
-            'Do you want to submit latest Gerrit patchset and bypass hooks?\n'
-            'Press Enter to continue, Ctrl+C to abort.')
-      print('WARNING: bypassing hooks and submitting latest uploaded patchset')
+        confirm_or_exit(
+            'Do you want to submit latest Gerrit patchset and bypass hooks?\n',
+            action='submit')
+      print('WARNING: Bypassing hooks and submitting latest uploaded patchset.')
     elif not bypass_hooks:
       hook_results = self.RunHook(
           committing=True,
@@ -2530,14 +2733,13 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
     links = self._GetChangeCommit().get('web_links', [])
     for link in links:
       if link.get('name') == 'gitiles' and link.get('url'):
-        print('Landed as %s' % link.get('url'))
+        print('Landed as: %s' % link.get('url'))
         break
     return 0
 
   def CMDPatchWithParsedIssue(self, parsed_issue_arg, reject, nocommit,
-                              directory):
+                              directory, force):
     assert not reject
-    assert not nocommit
     assert not directory
     assert parsed_issue_arg.valid
 
@@ -2565,33 +2767,67 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
         DieWithError('Couldn\'t find patchset %i in change %i' %
                      (parsed_issue_arg.patchset, self.GetIssue()))
 
+    remote_url = self._changelist.GetRemoteUrl()
+    if remote_url.endswith('.git'):
+      remote_url = remote_url[:-len('.git')]
     fetch_info = revision_info['fetch']['http']
+
+    if remote_url != fetch_info['url']:
+      DieWithError('Trying to patch a change from %s but this repo appears '
+                   'to be %s.' % (fetch_info['url'], remote_url))
+
     RunGit(['fetch', fetch_info['url'], fetch_info['ref']])
-    RunGit(['cherry-pick', 'FETCH_HEAD'])
-    self.SetIssue(self.GetIssue())
-    self.SetPatchset(patchset)
-    print('Committed patch for change %i patchset %i locally' %
-          (self.GetIssue(), self.GetPatchset()))
+
+    if force:
+      RunGit(['reset', '--hard', 'FETCH_HEAD'])
+      print('Checked out commit for change %i patchset %i locally' %
+            (parsed_issue_arg.issue, patchset))
+    elif nocommit:
+      RunGit(['cherry-pick', '--no-commit', 'FETCH_HEAD'])
+      print('Patch applied to index.')
+    else:
+      RunGit(['cherry-pick', 'FETCH_HEAD'])
+      print('Committed patch for change %i patchset %i locally.' %
+            (parsed_issue_arg.issue, patchset))
+      print('Note: this created a local commit which does not have '
+            'the same hash as the one uploaded for review. This will make '
+            'uploading changes based on top of this branch difficult.\n'
+            'If you want to do that, use "git cl patch --force" instead.')
+
+    if self.GetBranch():
+      self.SetIssue(parsed_issue_arg.issue)
+      self.SetPatchset(patchset)
+      fetched_hash = RunGit(['rev-parse', 'FETCH_HEAD']).strip()
+      self._GitSetBranchConfigValue('last-upload-hash', fetched_hash)
+      self._GitSetBranchConfigValue('gerritsquashhash', fetched_hash)
+    else:
+      print('WARNING: You are in detached HEAD state.\n'
+            'The patch has been applied to your checkout, but you will not be '
+            'able to upload a new patch set to the gerrit issue.\n'
+            'Try using the \'-b\' option if you would like to work on a '
+            'branch and/or upload a new patch set.')
+
     return 0
 
   @staticmethod
   def ParseIssueURL(parsed_url):
     if not parsed_url.scheme or not parsed_url.scheme.startswith('http'):
       return None
-    # Gerrit's new UI is https://domain/c/<issue_number>[/[patchset]]
-    # But current GWT UI is https://domain/#/c/<issue_number>[/[patchset]]
+    # Gerrit's new UI is https://domain/c/project/+/<issue_number>[/[patchset]]
+    # But old GWT UI is https://domain/#/c/project/+/<issue_number>[/[patchset]]
     # Short urls like https://domain/<issue_number> can be used, but don't allow
     # specifying the patchset (you'd 404), but we allow that here.
     if parsed_url.path == '/':
       part = parsed_url.fragment
     else:
       part = parsed_url.path
-    match = re.match('(/c)?/(\d+)(/(\d+)?/?)?$', part)
+    match = re.match('(/c(/.*/\+)?)?/(\d+)(/(\d+)?/?)?$', part)
     if match:
       return _ParsedIssueNumberArgument(
-          issue=int(match.group(2)),
-          patchset=int(match.group(4)) if match.group(4) else None,
-          hostname=parsed_url.netloc)
+          issue=int(match.group(3)),
+          patchset=int(match.group(5)) if match.group(5) else None,
+          hostname=parsed_url.netloc,
+          codereview='gerrit')
     return None
 
   def _GerritCommitMsgHookCheck(self, offer_removal):
@@ -2603,19 +2839,18 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
     data = gclient_utils.FileRead(hook)
     if not('From Gerrit Code Review' in data and 'add_ChangeId()' in data):
       return
-    print('Warning: you have Gerrit commit-msg hook installed.\n'
+    print('WARNING: You have Gerrit commit-msg hook installed.\n'
           'It is not necessary for uploading with git cl in squash mode, '
           'and may interfere with it in subtle ways.\n'
           'We recommend you remove the commit-msg hook.')
     if offer_removal:
-      reply = ask_for_data('Do you want to remove it now? [Yes/No]')
-      if reply.lower().startswith('y'):
+      if ask_for_explicit_yes('Do you want to remove it now?'):
         gclient_utils.rm_file_or_tree(hook)
         print('Gerrit commit-msg hook removed.')
       else:
         print('OK, will keep Gerrit commit-msg hook in place.')
 
-  def CMDUploadChange(self, options, args, change):
+  def CMDUploadChange(self, options, git_diff_args, custom_cl_base, change):
     """Upload the current branch to Gerrit."""
     if options.squash and options.no_squash:
       DieWithError('Can only use one of --squash or --no-squash')
@@ -2626,16 +2861,17 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
     elif options.no_squash:
       options.squash = False
 
-    # We assume the remote called "origin" is the one we want.
-    # It is probably not worthwhile to support different workflows.
-    gerrit_remote = 'origin'
-
     remote, remote_branch = self.GetRemoteBranch()
     branch = GetTargetRef(remote, remote_branch, options.target_branch)
 
     # This may be None; default fallback value is determined in logic below.
     title = options.title
-    automatic_title = False
+
+    # Extract bug number from branch name.
+    bug = options.bug
+    match = re.match(r'(?:bug|fix)[_-]?(\d+)', self.GetBranch())
+    if not bug and match:
+      bug = match.group(1)
 
     if options.squash:
       self._GerritCommitMsgHookCheck(offer_removal=not options.force)
@@ -2647,11 +2883,18 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
               'failed to fetch description from current Gerrit change %d\n'
               '%s' % (self.GetIssue(), self.GetIssueURL()))
         if not title:
-          default_title = RunGit(['show', '-s', '--format=%s', 'HEAD']).strip()
-          title = ask_for_data(
-              'Title for patchset [%s]: ' % default_title) or default_title
-          if title == default_title:
-            automatic_title = True
+          if options.message:
+            # When uploading a subsequent patchset, -m|--message is taken
+            # as the patchset title if --title was not provided.
+            title = options.message.strip()
+          else:
+            default_title = RunGit(
+                ['show', '-s', '--format=%s', 'HEAD']).strip()
+            if options.force:
+              title = default_title
+            else:
+              title = ask_for_data(
+                  'Title for patchset [%s]: ' % default_title) or default_title
         change_id = self._GetChangeDetail()['change_id']
         while True:
           footer_change_ids = git_footers.get_footer_change_id(message)
@@ -2659,7 +2902,7 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
             break
           if not footer_change_ids:
             message = git_footers.add_footer_change_id(message, change_id)
-            print('WARNING: appended missing Change-Id to change description')
+            print('WARNING: appended missing Change-Id to change description.')
             continue
           # There is already a valid footer but with different or several ids.
           # Doing this automatically is non-trivial as we don't want to lose
@@ -2675,10 +2918,10 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
               'and edit it if necessary but keep the "Change-Id: %s" footer\n'
               % (self.GetIssue(), '\n  '.join(footer_change_ids), change_id,
                  change_id))
-          ask_for_data('Press enter to edit now, Ctrl+C to abort')
+          confirm_or_exit(action='edit')
           if not options.force:
             change_desc = ChangeDescription(message)
-            change_desc.prompt(bug=options.bug)
+            change_desc.prompt(bug=bug)
             message = change_desc.description
             if not message:
               DieWithError("Description is empty. Aborting...")
@@ -2691,69 +2934,62 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
         if options.message:
           message = options.message
         else:
-          message = CreateDescriptionFromLog(args)
+          message = CreateDescriptionFromLog(git_diff_args)
           if options.title:
             message = options.title + '\n\n' + message
         change_desc = ChangeDescription(message)
+
         if not options.force:
-          change_desc.prompt(bug=options.bug)
+          change_desc.prompt(bug=bug)
         # On first upload, patchset title is always this string, while
         # --title flag gets converted to first line of message.
         title = 'Initial upload'
-        automatic_title = True
         if not change_desc.description:
           DieWithError("Description is empty. Aborting...")
-        message = change_desc.description
-        change_ids = git_footers.get_footer_change_id(message)
+        change_ids = git_footers.get_footer_change_id(change_desc.description)
         if len(change_ids) > 1:
           DieWithError('too many Change-Id footers, at most 1 allowed.')
         if not change_ids:
           # Generate the Change-Id automatically.
-          message = git_footers.add_footer_change_id(
-              message, GenerateGerritChangeId(message))
-          change_desc.set_description(message)
-          change_ids = git_footers.get_footer_change_id(message)
+          change_desc.set_description(git_footers.add_footer_change_id(
+              change_desc.description,
+              GenerateGerritChangeId(change_desc.description)))
+          change_ids = git_footers.get_footer_change_id(change_desc.description)
           assert len(change_ids) == 1
         change_id = change_ids[0]
 
-      remote, upstream_branch = self.FetchUpstreamTuple(self.GetBranch())
-      if remote is '.':
-        # If our upstream branch is local, we base our squashed commit on its
-        # squashed version.
-        upstream_branch_name = scm.GIT.ShortBranchName(upstream_branch)
-        # Check the squashed hash of the parent.
-        parent = RunGit(['config',
-                         'branch.%s.gerritsquashhash' % upstream_branch_name],
-                        error_ok=True).strip()
-        # Verify that the upstream branch has been uploaded too, otherwise
-        # Gerrit will create additional CLs when uploading.
-        if not parent or (RunGitSilent(['rev-parse', upstream_branch + ':']) !=
-                          RunGitSilent(['rev-parse', parent + ':'])):
-          DieWithError(
-              '\nUpload upstream branch %s first.\n'
-              'It is likely that this branch has been rebased since its last '
-              'upload, so you just need to upload it again.\n'
-              '(If you uploaded it with --no-squash, then branch dependencies '
-              'are not supported, and you should reupload with --squash.)'
-              % upstream_branch_name, change_desc)
-      else:
-        parent = self.GetCommonAncestorWithUpstream()
+      if options.reviewers or options.tbrs or options.add_owners_to:
+        change_desc.update_reviewers(options.reviewers, options.tbrs,
+                                     options.add_owners_to, change)
 
+      remote, upstream_branch = self.FetchUpstreamTuple(self.GetBranch())
+      parent = self._ComputeParent(remote, upstream_branch, custom_cl_base,
+                                   options.force, change_desc)
       tree = RunGit(['rev-parse', 'HEAD:']).strip()
-      ref_to_push = RunGit(['commit-tree', tree, '-p', parent,
-                            '-m', message]).strip()
+      with tempfile.NamedTemporaryFile(delete=False) as desc_tempfile:
+        desc_tempfile.write(change_desc.description)
+        desc_tempfile.close()
+        ref_to_push = RunGit(['commit-tree', tree, '-p', parent,
+                              '-F', desc_tempfile.name]).strip()
+        os.remove(desc_tempfile.name)
     else:
       change_desc = ChangeDescription(
-          options.message or CreateDescriptionFromLog(args))
+          options.message or CreateDescriptionFromLog(git_diff_args))
       if not change_desc.description:
         DieWithError("Description is empty. Aborting...")
 
       if not git_footers.get_footer_change_id(change_desc.description):
         DownloadGerritHook(False)
-        change_desc.set_description(self._AddChangeIdToCommitMessage(options,
-                                                                     args))
+        change_desc.set_description(
+            self._AddChangeIdToCommitMessage(options, git_diff_args))
+      if options.reviewers or options.tbrs or options.add_owners_to:
+        change_desc.update_reviewers(options.reviewers, options.tbrs,
+                                     options.add_owners_to, change)
       ref_to_push = 'HEAD'
-      parent = '%s/%s' % (gerrit_remote, branch)
+      # For no-squash mode, we assume the remote called "origin" is the one we
+      # want. It is not worthwhile to support different workflows for
+      # no-squash mode.
+      parent = 'origin/%s' % branch
       change_id = git_footers.get_footer_change_id(change_desc.description)[0]
 
     assert change_desc
@@ -2765,54 +3001,47 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
       print('git log %s..%s' % (parent, ref_to_push))
       print('You can also use `git squash-branch` to squash these into a '
             'single commit.')
-      ask_for_data('About to upload; enter to confirm.')
+      confirm_or_exit(action='upload')
 
-    if options.reviewers or options.tbr_owners:
-      change_desc.update_reviewers(options.reviewers, options.tbr_owners,
-                                   change)
+    if options.reviewers or options.tbrs or options.add_owners_to:
+      change_desc.update_reviewers(options.reviewers, options.tbrs,
+                                   options.add_owners_to, change)
 
     # Extra options that can be specified at push time. Doc:
     # https://gerrit-review.googlesource.com/Documentation/user-upload.html
     refspec_opts = []
-    if change_desc.get_reviewers(tbr_only=True):
-      print('Adding self-LGTM (Code-Review +1) because of TBRs')
-      refspec_opts.append('l=Code-Review+1')
 
-    if title:
-      if not re.match(r'^[\w ]+$', title):
-        title = re.sub(r'[^\w ]', '', title)
-        if not automatic_title:
-          print('WARNING: Patchset title may only contain alphanumeric chars '
-                'and spaces. You can edit it in the UI. '
-                'See https://crbug.com/663787.\n'
-                'Cleaned up title: %s' % title)
-      # Per doc, spaces must be converted to underscores, and Gerrit will do the
-      # reverse on its side.
-      refspec_opts.append('m=' + title.replace(' ', '_'))
-
+    # By default, new changes are started in WIP mode, and subsequent patchsets
+    # don't send email. At any time, passing --send-mail will mark the change
+    # ready and send email for that particular patch.
     if options.send_mail:
-      if not change_desc.get_reviewers():
-        DieWithError('Must specify reviewers to send email.', change_desc)
+      refspec_opts.append('ready')
       refspec_opts.append('notify=ALL')
+    elif not self.GetIssue():
+      refspec_opts.append('wip')
     else:
       refspec_opts.append('notify=NONE')
 
-    reviewers = change_desc.get_reviewers()
-    if reviewers:
-      # TODO(tandrii): remove this horrible hack once (Poly)Gerrit fixes their
-      # side for real (b/34702620).
-      def clean_invisible_chars(email):
-        return email.decode('unicode_escape').encode('ascii', 'ignore')
-      refspec_opts.extend('r=' + clean_invisible_chars(email).strip()
-                          for email in reviewers)
+    # TODO(tandrii): options.message should be posted as a comment
+    # if --send-mail is set on non-initial upload as Rietveld used to do it.
+
+    if title:
+      # Punctuation and whitespace in |title| must be percent-encoded.
+      refspec_opts.append('m=' + gerrit_util.PercentEncodeForGitRef(title))
 
     if options.private:
-      refspec_opts.append('draft')
+      refspec_opts.append('private')
 
     if options.topic:
       # Documentation on Gerrit topics is here:
       # https://gerrit-review.googlesource.com/Documentation/user-upload.html#topic
       refspec_opts.append('topic=%s' % options.topic)
+
+    # Gerrit sorts hashtags, so order is not important.
+    hashtags = {change_desc.sanitize_hash_tag(t) for t in options.hashtags}
+    if not self.GetIssue():
+      hashtags.update(change_desc.get_hash_tags())
+    refspec_opts += ['hashtag=%s' % t for t in sorted(hashtags)]
 
     refspec_suffix = ''
     if refspec_opts:
@@ -2830,10 +3059,14 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
           filter_fn=lambda _: sys.stdout.flush())
     except subprocess2.CalledProcessError:
       DieWithError('Failed to create a change. Please examine output above '
-                   'for the reason of the failure. ', change_desc)
+                   'for the reason of the failure.\n'
+                   'Hint: run command below to diagnose common Git/Gerrit '
+                   'credential problems:\n'
+                   '  git cl creds-check\n',
+                   change_desc)
 
     if options.squash:
-      regex = re.compile(r'remote:\s+https?://[\w\-\.\/]*/(\d+)\s.*')
+      regex = re.compile(r'remote:\s+https?://[\w\-\.\+\/#]*/(\d+)\s.*')
       change_numbers = [m.group(1)
                         for m in map(regex.match, push_stdout.splitlines())
                         if m]
@@ -2844,18 +3077,95 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
       self.SetIssue(change_numbers[0])
       self._GitSetBranchConfigValue('gerritsquashhash', ref_to_push)
 
+    reviewers = sorted(change_desc.get_reviewers())
+
     # Add cc's from the CC_LIST and --cc flag (if any).
-    cc = self.GetCCList().split(',')
+    if not options.private:
+      cc = self.GetCCList().split(',')
+    else:
+      cc = []
     if options.cc:
       cc.extend(options.cc)
     cc = filter(None, [email.strip() for email in cc])
     if change_desc.get_cced():
       cc.extend(change_desc.get_cced())
-    if cc:
-      gerrit_util.AddReviewers(
-          self._GetGerritHost(), self.GetIssue(), cc,
-          is_reviewer=False, notify=bool(options.send_mail))
+
+    gerrit_util.AddReviewers(
+        self._GetGerritHost(), self.GetIssue(), reviewers, cc,
+        notify=bool(options.send_mail))
+
+    if change_desc.get_reviewers(tbr_only=True):
+      labels = self._GetChangeDetail(['LABELS']).get('labels', {})
+      score = 1
+      if 'Code-Review' in labels and 'values' in labels['Code-Review']:
+        score = max([int(x) for x in labels['Code-Review']['values'].keys()])
+      print('Adding self-LGTM (Code-Review +%d) because of TBRs.' % score)
+      gerrit_util.SetReview(
+          self._GetGerritHost(), self.GetIssue(),
+          msg='Self-approving for TBR',
+          labels={'Code-Review': score})
+
     return 0
+
+  def _ComputeParent(self, remote, upstream_branch, custom_cl_base, force,
+                     change_desc):
+    """Computes parent of the generated commit to be uploaded to Gerrit.
+
+    Returns revision or a ref name.
+    """
+    if custom_cl_base:
+      # Try to avoid creating additional unintended CLs when uploading, unless
+      # user wants to take this risk.
+      local_ref_of_target_remote = self.GetRemoteBranch()[1]
+      code, _ = RunGitWithCode(['merge-base', '--is-ancestor', custom_cl_base,
+                                local_ref_of_target_remote])
+      if code == 1:
+        print('\nWARNING: Manually specified base of this CL `%s` '
+              'doesn\'t seem to belong to target remote branch `%s`.\n\n'
+              'If you proceed with upload, more than 1 CL may be created by '
+              'Gerrit as a result, in turn confusing or crashing git cl.\n\n'
+              'If you are certain that specified base `%s` has already been '
+              'uploaded to Gerrit as another CL, you may proceed.\n' %
+              (custom_cl_base, local_ref_of_target_remote, custom_cl_base))
+        if not force:
+          confirm_or_exit(
+              'Do you take responsibility for cleaning up potential mess '
+              'resulting from proceeding with upload?',
+              action='upload')
+      return custom_cl_base
+
+    if remote != '.':
+      return self.GetCommonAncestorWithUpstream()
+
+    # If our upstream branch is local, we base our squashed commit on its
+    # squashed version.
+    upstream_branch_name = scm.GIT.ShortBranchName(upstream_branch)
+
+    if upstream_branch_name == 'master':
+      return self.GetCommonAncestorWithUpstream()
+
+    # Check the squashed hash of the parent.
+    # TODO(tandrii): consider checking parent change in Gerrit and using its
+    # hash if tree hash of latest parent revision (patchset) in Gerrit matches
+    # the tree hash of the parent branch. The upside is less likely bogus
+    # requests to reupload parent change just because it's uploadhash is
+    # missing, yet the downside likely exists, too (albeit unknown to me yet).
+    parent = RunGit(['config',
+                     'branch.%s.gerritsquashhash' % upstream_branch_name],
+                    error_ok=True).strip()
+    # Verify that the upstream branch has been uploaded too, otherwise
+    # Gerrit will create additional CLs when uploading.
+    if not parent or (RunGitSilent(['rev-parse', upstream_branch + ':']) !=
+                      RunGitSilent(['rev-parse', parent + ':'])):
+      DieWithError(
+          '\nUpload upstream branch %s first.\n'
+          'It is likely that this branch has been rebased since its last '
+          'upload, so you just need to upload it again.\n'
+          '(If you uploaded it with --no-squash, then branch dependencies '
+          'are not supported, and you should reupload with --squash.)'
+          % upstream_branch_name,
+          change_desc)
+    return parent
 
   def _AddChangeIdToCommitMessage(self, options, args):
     """Re-commits using the current message, assumes the commit hook is in
@@ -2878,11 +3188,10 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
         _CQState.DRY_RUN: 1,
         _CQState.COMMIT:  2,
     }
-    kwargs = {'labels': {'Commit-Queue': vote_map[new_state]}}
-    if new_state == _CQState.DRY_RUN:
-      # Don't spam everybody reviewer/owner.
-      kwargs['notify'] = 'NONE'
-    gerrit_util.SetReview(self._GetGerritHost(), self.GetIssue(), **kwargs)
+    labels = {'Commit-Queue': vote_map[new_state]}
+    notify = False if new_state == _CQState.DRY_RUN else None
+    gerrit_util.SetReview(self._GetGerritHost(), self.GetIssue(),
+                          labels=labels, notify=notify)
 
   def CannotTriggerTryJobReason(self):
     try:
@@ -2893,8 +3202,8 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
     if data['status'] in ('ABANDONED', 'MERGED'):
       return 'CL %s is closed' % self.GetIssue()
 
-  def GetTryjobProperties(self, patchset=None):
-    """Returns dictionary of properties to launch tryjob."""
+  def GetTryJobProperties(self, patchset=None):
+    """Returns dictionary of properties to launch try job."""
     data = self._GetChangeDetail(['ALL_REVISIONS'])
     patchset = int(patchset or self.GetPatchset())
     assert patchset
@@ -2917,6 +3226,10 @@ class _GerritChangelistImpl(_ChangelistCodereviewBase):
 
   def GetIssueOwner(self):
     return self._GetChangeDetail(['DETAILED_ACCOUNTS'])['owner']['email']
+
+  def GetReviewers(self):
+    details = self._GetChangeDetail(['DETAILED_ACCOUNTS'])
+    return [reviewer['email'] for reviewer in details['reviewers']['REVIEWER']]
 
 
 _CODEREVIEW_IMPLEMENTATIONS = {
@@ -3003,8 +3316,12 @@ class ChangeDescription(object):
   """Contains a parsed form of the change description."""
   R_LINE = r'^[ \t]*(TBR|R)[ \t]*=[ \t]*(.*?)[ \t]*$'
   CC_LINE = r'^[ \t]*(CC)[ \t]*=[ \t]*(.*?)[ \t]*$'
-  BUG_LINE = r'^[ \t]*(BUG)[ \t]*=[ \t]*(.*?)[ \t]*$'
+  BUG_LINE = r'^[ \t]*(?:(BUG)[ \t]*=|Bug:)[ \t]*(.*?)[ \t]*$'
   CHERRY_PICK_LINE = r'^\(cherry picked from commit [a-fA-F0-9]{40}\)$'
+  STRIP_HASH_TAG_PREFIX = r'^(\s*(revert|reland)( "|:)?\s*)*'
+  BRACKET_HASH_TAG = r'\s*\[([^\[\]]+)\]'
+  COLON_SEPARATED_HASH_TAG = r'^([a-zA-Z0-9_\- ]+):'
+  BAD_HASH_TAG_CHUNK = r'[^a-zA-Z0-9]+'
 
   def __init__(self, description):
     self._description_lines = (description or '').strip().splitlines()
@@ -3024,14 +3341,34 @@ class ChangeDescription(object):
       lines.pop(-1)
     self._description_lines = lines
 
-  def update_reviewers(self, reviewers, add_owners_tbr=False, change=None):
-    """Rewrites the R=/TBR= line(s) as a single line each."""
-    assert isinstance(reviewers, list), reviewers
-    if not reviewers and not add_owners_tbr:
-      return
-    reviewers = reviewers[:]
+  def update_reviewers(self, reviewers, tbrs, add_owners_to=None, change=None):
+    """Rewrites the R=/TBR= line(s) as a single line each.
 
-    # Get the set of R= and TBR= lines and remove them from the desciption.
+    Args:
+      reviewers (list(str)) - list of additional emails to use for reviewers.
+      tbrs (list(str)) - list of additional emails to use for TBRs.
+      add_owners_to (None|'R'|'TBR') - Pass to do an OWNERS lookup for files in
+        the change that are missing OWNER coverage. If this is not None, you
+        must also pass a value for `change`.
+      change (Change) - The Change that should be used for OWNERS lookups.
+    """
+    assert isinstance(reviewers, list), reviewers
+    assert isinstance(tbrs, list), tbrs
+
+    assert add_owners_to in (None, 'TBR', 'R'), add_owners_to
+    assert not add_owners_to or change, add_owners_to
+
+    if not reviewers and not tbrs and not add_owners_to:
+      return
+
+    reviewers = set(reviewers)
+    tbrs = set(tbrs)
+    LOOKUP = {
+      'TBR': tbrs,
+      'R': reviewers,
+    }
+
+    # Get the set of R= and TBR= lines and remove them from the description.
     regexp = re.compile(self.R_LINE)
     matches = [regexp.match(line) for line in self._description_lines]
     new_desc = [l for i, l in enumerate(self._description_lines)
@@ -3039,29 +3376,27 @@ class ChangeDescription(object):
     self.set_description(new_desc)
 
     # Construct new unified R= and TBR= lines.
-    r_names = []
-    tbr_names = []
+
+    # First, update tbrs/reviewers with names from the R=/TBR= lines (if any).
     for match in matches:
       if not match:
         continue
-      people = cleanup_list([match.group(2).strip()])
-      if match.group(1) == 'TBR':
-        tbr_names.extend(people)
-      else:
-        r_names.extend(people)
-    for name in r_names:
-      if name not in reviewers:
-        reviewers.append(name)
-    if add_owners_tbr:
+      LOOKUP[match.group(1)].update(cleanup_list([match.group(2).strip()]))
+
+    # Next, maybe fill in OWNERS coverage gaps to either tbrs/reviewers.
+    if add_owners_to:
       owners_db = owners.Database(change.RepositoryRoot(),
-        fopen=file, os_path=os.path)
-      all_reviewers = set(tbr_names + reviewers)
+                                  fopen=file, os_path=os.path)
       missing_files = owners_db.files_not_covered_by(change.LocalPaths(),
-                                                     all_reviewers)
-      tbr_names.extend(owners_db.reviewers_for(missing_files,
-                                               change.author_email))
-    new_r_line = 'R=' + ', '.join(reviewers) if reviewers else None
-    new_tbr_line = 'TBR=' + ', '.join(tbr_names) if tbr_names else None
+                                                     (tbrs | reviewers))
+      LOOKUP[add_owners_to].update(
+        owners_db.reviewers_for(missing_files, change.author_email))
+
+    # If any folks ended up in both groups, remove them from tbrs.
+    tbrs -= reviewers
+
+    new_r_line = 'R=' + ', '.join(sorted(reviewers)) if reviewers else None
+    new_tbr_line = 'TBR=' + ', '.join(sorted(tbrs)) if tbrs else None
 
     # Put the new lines in the description where the old first R= line was.
     line_loc = next((i for i, match in enumerate(matches) if match), -1)
@@ -3076,7 +3411,7 @@ class ChangeDescription(object):
       if new_tbr_line:
         self.append_footer(new_tbr_line)
 
-  def prompt(self, bug=None):
+  def prompt(self, bug=None, git_footer=True):
     """Asks the user to update the description."""
     self.set_description([
       '# Enter a description of the change.',
@@ -3090,9 +3425,11 @@ class ChangeDescription(object):
     if not any((regexp.match(line) for line in self._description_lines)):
       prefix = settings.GetBugPrefix()
       values = list(_get_bug_line_values(prefix, bug or '')) or [prefix]
-      for value in values:
-        # TODO(tandrii): change this to 'Bug: xxx' to be a proper Gerrit footer.
-        self.append_footer('BUG=%s' % value)
+      if git_footer:
+        self.append_footer('Bug: %s' % ', '.join(values))
+      else:
+        for value in values:
+          self.append_footer('BUG=%s' % value)
 
     content = gclient_utils.RunEditor(self.description, True,
                                       git_editor=settings.GetGitEditor())
@@ -3100,8 +3437,9 @@ class ChangeDescription(object):
       DieWithError('Running editor failed')
     lines = content.splitlines()
 
-    # Strip off comments.
-    clean_lines = [line.rstrip() for line in lines if not line.startswith('#')]
+    # Strip off comments and default inserted "Bug:" line.
+    clean_lines = [line.rstrip() for line in lines if not
+                   (line.startswith('#') or line.rstrip() == "Bug:")]
     if not clean_lines:
       DieWithError('No CL description, aborting')
     self.set_description(clean_lines)
@@ -3157,6 +3495,37 @@ class ChangeDescription(object):
     cced = [match.group(2).strip() for match in matches if match]
     return cleanup_list(cced)
 
+  def get_hash_tags(self):
+    """Extracts and sanitizes a list of Gerrit hashtags."""
+    subject = (self._description_lines or ('',))[0]
+    subject = re.sub(
+        self.STRIP_HASH_TAG_PREFIX, '', subject, flags=re.IGNORECASE)
+
+    tags = []
+    start = 0
+    bracket_exp = re.compile(self.BRACKET_HASH_TAG)
+    while True:
+      m = bracket_exp.match(subject, start)
+      if not m:
+        break
+      tags.append(self.sanitize_hash_tag(m.group(1)))
+      start = m.end()
+
+    if not tags:
+      # Try "Tag: " prefix.
+      m = re.match(self.COLON_SEPARATED_HASH_TAG, subject)
+      if m:
+        tags.append(self.sanitize_hash_tag(m.group(1)))
+    return tags
+
+  @classmethod
+  def sanitize_hash_tag(cls, tag):
+    """Returns a sanitized Gerrit hash tag.
+
+    A sanitized hashtag can be used as a git push refspec parameter value.
+    """
+    return re.sub(cls.BAD_HASH_TAG_CHUNK, '-', tag).strip('-').lower()
+
   def update_with_git_number_footers(self, parent_hash, parent_msg, dest_ref):
     """Updates this commit description given the parent.
 
@@ -3179,13 +3548,14 @@ class ChangeDescription(object):
         re.match(self.CHERRY_PICK_LINE, self._description_lines[-1])):
       cp_line = self._description_lines.pop()
 
-    top_lines, _, parsed_footers = git_footers.split_footers(self.description)
+    top_lines, footer_lines, _ = git_footers.split_footers(self.description)
 
     # Original-ify all Cr- footers, to avoid re-lands, cherry-picks, or just
     # user interference with actual footers we'd insert below.
-    for i, (k, v) in enumerate(parsed_footers):
-      if k.startswith('Cr-'):
-        parsed_footers[i] = (k.replace('Cr-', 'Cr-Original-'), v)
+    for i, line in enumerate(footer_lines):
+      k, v = git_footers.parse_footer(line) or (None, None)
+      if k and k.startswith('Cr-'):
+        footer_lines[i] = '%s: %s' % ('Cr-Original-' + k[len('Cr-'):], v)
 
     # Add Position and Lineage footers based on the parent.
     lineage = list(reversed(parent_footer_map.get('Cr-Branched-From', [])))
@@ -3197,30 +3567,32 @@ class ChangeDescription(object):
       lineage.insert(0, '%s-%s@{#%d}' % (parent_hash, parent_position[0],
                                          int(parent_position[1])))
 
-    parsed_footers.append(('Cr-Commit-Position',
-                           '%s@{#%d}' % (dest_ref, number)))
-    parsed_footers.extend(('Cr-Branched-From', v) for v in lineage)
+    footer_lines.append('Cr-Commit-Position: %s@{#%d}' % (dest_ref, number))
+    footer_lines.extend('Cr-Branched-From: %s' % v for v in lineage)
 
     self._description_lines = top_lines
     if cp_line:
       self._description_lines.append(cp_line)
     if self._description_lines[-1] != '':
       self._description_lines.append('')  # Ensure footer separator.
-    self._description_lines.extend('%s: %s' % kv for kv in parsed_footers)
+    self._description_lines.extend(footer_lines)
 
 
-def get_approving_reviewers(props):
+def get_approving_reviewers(props, disapproval=False):
   """Retrieves the reviewers that approved a CL from the issue properties with
   messages.
 
   Note that the list may contain reviewers that are not committer, thus are not
   considered by the CQ.
+
+  If disapproval is True, instead returns reviewers who 'not lgtm'd the CL.
   """
+  approval_type = 'disapproval' if disapproval else 'approval'
   return sorted(
       set(
         message['sender']
         for message in props['messages']
-        if message['approval'] and message['sender'] in props['reviewers']
+        if message[approval_type] and message['sender'] in props['reviewers']
       )
   )
 
@@ -3376,11 +3748,310 @@ def GetRietveldCodereviewSettingsInteractively():
               'run-post-upload-hook', False)
 
 
+class _GitCookiesChecker(object):
+  """Provides facilities for validating and suggesting fixes to .gitcookies."""
+
+  _GOOGLESOURCE = 'googlesource.com'
+
+  def __init__(self):
+    # Cached list of [host, identity, source], where source is either
+    # .gitcookies or .netrc.
+    self._all_hosts = None
+
+  def ensure_configured_gitcookies(self):
+    """Runs checks and suggests fixes to make git use .gitcookies from default
+    path."""
+    default = gerrit_util.CookiesAuthenticator.get_gitcookies_path()
+    configured_path = RunGitSilent(
+        ['config', '--global', 'http.cookiefile']).strip()
+    configured_path = os.path.expanduser(configured_path)
+    if configured_path:
+      self._ensure_default_gitcookies_path(configured_path, default)
+    else:
+      self._configure_gitcookies_path(default)
+
+  @staticmethod
+  def _ensure_default_gitcookies_path(configured_path, default_path):
+    assert configured_path
+    if configured_path == default_path:
+      print('git is already configured to use your .gitcookies from %s' %
+            configured_path)
+      return
+
+    print('WARNING: You have configured custom path to .gitcookies: %s\n'
+          'Gerrit and other depot_tools expect .gitcookies at %s\n' %
+          (configured_path, default_path))
+
+    if not os.path.exists(configured_path):
+      print('However, your configured .gitcookies file is missing.')
+      confirm_or_exit('Reconfigure git to use default .gitcookies?',
+                      action='reconfigure')
+      RunGit(['config', '--global', 'http.cookiefile', default_path])
+      return
+
+    if os.path.exists(default_path):
+      print('WARNING: default .gitcookies file already exists %s' %
+            default_path)
+      DieWithError('Please delete %s manually and re-run git cl creds-check' %
+                   default_path)
+
+    confirm_or_exit('Move existing .gitcookies to default location?',
+                    action='move')
+    shutil.move(configured_path, default_path)
+    RunGit(['config', '--global', 'http.cookiefile', default_path])
+    print('Moved and reconfigured git to use .gitcookies from %s' %
+          default_path)
+
+  @staticmethod
+  def _configure_gitcookies_path(default_path):
+    netrc_path = gerrit_util.CookiesAuthenticator.get_netrc_path()
+    if os.path.exists(netrc_path):
+      print('You seem to be using outdated .netrc for git credentials: %s' %
+            netrc_path)
+    print('This tool will guide you through setting up recommended '
+          '.gitcookies store for git credentials.\n'
+          '\n'
+          'IMPORTANT: If something goes wrong and you decide to go back, do:\n'
+          '  git config --global --unset http.cookiefile\n'
+          '  mv %s %s.backup\n\n' % (default_path, default_path))
+    confirm_or_exit(action='setup .gitcookies')
+    RunGit(['config', '--global', 'http.cookiefile', default_path])
+    print('Configured git to use .gitcookies from %s' % default_path)
+
+  def get_hosts_with_creds(self, include_netrc=False):
+    if self._all_hosts is None:
+      a = gerrit_util.CookiesAuthenticator()
+      self._all_hosts = [
+          (h, u, s)
+          for h, u, s in itertools.chain(
+              ((h, u, '.netrc') for h, (u, _, _) in a.netrc.hosts.iteritems()),
+              ((h, u, '.gitcookies') for h, (u, _) in a.gitcookies.iteritems())
+          )
+          if h.endswith(self._GOOGLESOURCE)
+      ]
+
+    if include_netrc:
+      return self._all_hosts
+    return [(h, u, s) for h, u, s in self._all_hosts if s != '.netrc']
+
+  def print_current_creds(self, include_netrc=False):
+    hosts = sorted(self.get_hosts_with_creds(include_netrc=include_netrc))
+    if not hosts:
+      print('No Git/Gerrit credentials found')
+      return
+    lengths = [max(map(len, (row[i] for row in hosts))) for i in xrange(3)]
+    header = [('Host', 'User', 'Which file'),
+              ['=' * l for l in lengths]]
+    for row in (header + hosts):
+      print('\t'.join((('%%+%ds' % l) % s)
+                       for l, s in zip(lengths, row)))
+
+  @staticmethod
+  def _parse_identity(identity):
+    """Parses identity "git-<username>.domain" into <username> and domain."""
+    # Special case: usernames that contain ".", which are generally not
+    # distinguishable from sub-domains. But we do know typical domains:
+    if identity.endswith('.chromium.org'):
+      domain = 'chromium.org'
+      username = identity[:-len('.chromium.org')]
+    else:
+      username, domain = identity.split('.', 1)
+    if username.startswith('git-'):
+      username = username[len('git-'):]
+    return username, domain
+
+  def _get_usernames_of_domain(self, domain):
+    """Returns list of usernames referenced by .gitcookies in a given domain."""
+    identities_by_domain = {}
+    for _, identity, _ in self.get_hosts_with_creds():
+      username, domain = self._parse_identity(identity)
+      identities_by_domain.setdefault(domain, []).append(username)
+    return identities_by_domain.get(domain)
+
+  def _canonical_git_googlesource_host(self, host):
+    """Normalizes Gerrit hosts (with '-review') to Git host."""
+    assert host.endswith(self._GOOGLESOURCE)
+    # Prefix doesn't include '.' at the end.
+    prefix = host[:-(1 + len(self._GOOGLESOURCE))]
+    if prefix.endswith('-review'):
+      prefix = prefix[:-len('-review')]
+    return prefix + '.' + self._GOOGLESOURCE
+
+  def _canonical_gerrit_googlesource_host(self, host):
+    git_host = self._canonical_git_googlesource_host(host)
+    prefix = git_host.split('.', 1)[0]
+    return prefix + '-review.' + self._GOOGLESOURCE
+
+  def _get_counterpart_host(self, host):
+    assert host.endswith(self._GOOGLESOURCE)
+    git = self._canonical_git_googlesource_host(host)
+    gerrit = self._canonical_gerrit_googlesource_host(git)
+    return git if gerrit == host else gerrit
+
+  def has_generic_host(self):
+    """Returns whether generic .googlesource.com has been configured.
+
+    Chrome Infra recommends to use explicit ${host}.googlesource.com instead.
+    """
+    for host, _, _ in self.get_hosts_with_creds(include_netrc=False):
+      if host == '.' + self._GOOGLESOURCE:
+        return True
+    return False
+
+  def _get_git_gerrit_identity_pairs(self):
+    """Returns map from canonic host to pair of identities (Git, Gerrit).
+
+    One of identities might be None, meaning not configured.
+    """
+    host_to_identity_pairs = {}
+    for host, identity, _ in self.get_hosts_with_creds():
+      canonical = self._canonical_git_googlesource_host(host)
+      pair = host_to_identity_pairs.setdefault(canonical, [None, None])
+      idx = 0 if canonical == host else 1
+      pair[idx] = identity
+    return host_to_identity_pairs
+
+  def get_partially_configured_hosts(self):
+    return set(
+        (host if i1 else self._canonical_gerrit_googlesource_host(host))
+        for host, (i1, i2) in self._get_git_gerrit_identity_pairs().iteritems()
+        if None in (i1, i2) and host != '.' + self._GOOGLESOURCE)
+
+  def get_conflicting_hosts(self):
+    return set(
+        host
+        for host, (i1, i2) in self._get_git_gerrit_identity_pairs().iteritems()
+        if None not in (i1, i2) and i1 != i2)
+
+  def get_duplicated_hosts(self):
+    counters = collections.Counter(h for h, _, _ in self.get_hosts_with_creds())
+    return set(host for host, count in counters.iteritems() if count > 1)
+
+  _EXPECTED_HOST_IDENTITY_DOMAINS = {
+    'chromium.googlesource.com': 'chromium.org',
+    'chrome-internal.googlesource.com': 'google.com',
+  }
+
+  def get_hosts_with_wrong_identities(self):
+    """Finds hosts which **likely** reference wrong identities.
+
+    Note: skips hosts which have conflicting identities for Git and Gerrit.
+    """
+    hosts = set()
+    for host, expected in self._EXPECTED_HOST_IDENTITY_DOMAINS.iteritems():
+      pair = self._get_git_gerrit_identity_pairs().get(host)
+      if pair and pair[0] == pair[1]:
+        _, domain = self._parse_identity(pair[0])
+        if domain != expected:
+          hosts.add(host)
+    return hosts
+
+  @staticmethod
+  def _format_hosts(hosts, extra_column_func=None):
+    hosts = sorted(hosts)
+    assert hosts
+    if extra_column_func is None:
+      extras = [''] * len(hosts)
+    else:
+      extras = [extra_column_func(host) for host in hosts]
+    tmpl = '%%-%ds    %%-%ds' % (max(map(len, hosts)), max(map(len, extras)))
+    lines = []
+    for he in zip(hosts, extras):
+      lines.append(tmpl % he)
+    return lines
+
+  def _find_problems(self):
+    if self.has_generic_host():
+      yield ('.googlesource.com wildcard record detected',
+             ['Chrome Infrastructure team recommends to list full host names '
+              'explicitly.'],
+             None)
+
+    dups = self.get_duplicated_hosts()
+    if dups:
+      yield ('The following hosts were defined twice',
+             self._format_hosts(dups),
+             None)
+
+    partial = self.get_partially_configured_hosts()
+    if partial:
+      yield ('Credentials should come in pairs for Git and Gerrit hosts. '
+             'These hosts are missing',
+             self._format_hosts(partial, lambda host: 'but %s defined' %
+                self._get_counterpart_host(host)),
+             partial)
+
+    conflicting = self.get_conflicting_hosts()
+    if conflicting:
+      yield ('The following Git hosts have differing credentials from their '
+             'Gerrit counterparts',
+             self._format_hosts(conflicting, lambda host: '%s vs %s' %
+                 tuple(self._get_git_gerrit_identity_pairs()[host])),
+             conflicting)
+
+    wrong = self.get_hosts_with_wrong_identities()
+    if wrong:
+      yield ('These hosts likely use wrong identity',
+             self._format_hosts(wrong, lambda host: '%s but %s recommended' %
+                (self._get_git_gerrit_identity_pairs()[host][0],
+                 self._EXPECTED_HOST_IDENTITY_DOMAINS[host])),
+             wrong)
+
+  def find_and_report_problems(self):
+    """Returns True if there was at least one problem, else False."""
+    found = False
+    bad_hosts = set()
+    for title, sublines, hosts in self._find_problems():
+      if not found:
+        found = True
+        print('\n\n.gitcookies problem report:\n')
+      bad_hosts.update(hosts or [])
+      print('  %s%s' % (title , (':' if sublines else '')))
+      if sublines:
+        print()
+        print('    %s' % '\n    '.join(sublines))
+      print()
+
+    if bad_hosts:
+      assert found
+      print('  You can manually remove corresponding lines in your %s file and '
+            'visit the following URLs with correct account to generate '
+            'correct credential lines:\n' %
+            gerrit_util.CookiesAuthenticator.get_gitcookies_path())
+      print('    %s' % '\n    '.join(sorted(set(
+          gerrit_util.CookiesAuthenticator().get_new_password_url(
+              self._canonical_git_googlesource_host(host))
+          for host in bad_hosts
+      ))))
+    return found
+
+
+def CMDcreds_check(parser, args):
+  """Checks credentials and suggests changes."""
+  _, _ = parser.parse_args(args)
+
+  if gerrit_util.GceAuthenticator.is_gce():
+    DieWithError(
+        'This command is not designed for GCE, are you on a bot?\n'
+        'If you need to run this, export SKIP_GCE_AUTH_FOR_GIT=1 in your env.')
+
+  checker = _GitCookiesChecker()
+  checker.ensure_configured_gitcookies()
+
+  print('Your .netrc and .gitcookies have credentials for these hosts:')
+  checker.print_current_creds(include_netrc=True)
+
+  if not checker.find_and_report_problems():
+    print('\nNo problems detected in your .gitcookies file.')
+    return 0
+  return 1
+
+
 @subcommand.usage('[repo root containing codereview.settings]')
 def CMDconfig(parser, args):
   """Edits configuration for this tree."""
 
-  print('WARNING: git cl config works for Rietveld only')
+  print('WARNING: git cl config works for Rietveld only.')
   # TODO(tandrii): remove this once we switch to Gerrit.
   # See bugs http://crbug.com/637561 and http://crbug.com/600469.
   parser.add_option('--activate-update', action='store_true',
@@ -3430,9 +4101,10 @@ def CMDbaseurl(parser, args):
 def color_for_status(status):
   """Maps a Changelist status to color, for CMDstatus and other tools."""
   return {
-    'unsent': Fore.RED,
+    'unsent': Fore.YELLOW,
     'waiting': Fore.BLUE,
     'reply': Fore.YELLOW,
+    'not lgtm': Fore.RED,
     'lgtm': Fore.GREEN,
     'commit': Fore.MAGENTA,
     'closed': Fore.CYAN,
@@ -3460,7 +4132,7 @@ def get_cl_statuses(changes, fine_grained, max_processes=None):
 
   if not fine_grained:
     # Fast path which doesn't involve querying codereview servers.
-    # Do not use GetApprovingReviewers(), since it requires an HTTP request.
+    # Do not use get_approving_reviewers(), since it requires an HTTP request.
     for cl in changes:
       yield (cl, 'waiting' if cl.GetIssueURL() else 'error')
     return
@@ -3563,9 +4235,8 @@ def upload_branch_deps(cl, args):
     print('There are no dependent local branches for %s' % root_branch)
     return 0
 
-  print('This command will checkout all dependent branches and run '
-        '"git cl upload".')
-  ask_for_data('[Press enter to continue or ctrl-C to quit]')
+  confirm_or_exit('This command will checkout all dependent branches and run '
+                  '"git cl upload".', action='continue')
 
   # Add a default patchset title to all upload calls in Rietveld.
   if not cl.IsGerrit():
@@ -3687,12 +4358,13 @@ def CMDstatus(parser, args):
   """Show status of changelists.
 
   Colors are used to tell the state of the CL unless --fast is used:
-    - Red      not sent for review or broken
     - Blue     waiting for review
-    - Yellow   waiting for you to reply to review
+    - Yellow   waiting for you to reply to review, or not yet sent
     - Green    LGTM'ed
+    - Red      'not LGTM'ed
     - Magenta  in the commit queue
     - Cyan     was committed, branch can be deleted
+    - White    error, or unknown status
 
   Also see 'git cl comments'.
   """
@@ -3726,7 +4398,7 @@ def CMDstatus(parser, args):
       if issueid:
         print(issueid)
     elif options.field == 'patch':
-      patchset = cl.GetPatchset()
+      patchset = cl.GetMostRecentPatchset()
       if patchset:
         print(patchset)
     elif options.field == 'status':
@@ -3797,7 +4469,7 @@ def colorize_CMDstatus_doc():
   def colorize_line(line):
     for color in colors:
       if color in line.upper():
-        # Extract whitespaces first and the leading '-'.
+        # Extract whitespace first and the leading '-'.
         indent = len(line) - len(line.lstrip(' ')) + 1
         return line[:indent] + getattr(Fore, color) + line[indent:] + Fore.RESET
     return line
@@ -3807,8 +4479,11 @@ def colorize_CMDstatus_doc():
 
 
 def write_json(path, contents):
-  with open(path, 'w') as f:
-    json.dump(contents, f)
+  if path == '-':
+    json.dump(contents, sys.stdout)
+  else:
+    with open(path, 'w') as f:
+      json.dump(contents, f)
 
 
 @subcommand.usage('[issue_number]')
@@ -3821,15 +4496,15 @@ def CMDissue(parser, args):
                     help='Lookup the branch(es) for the specified issues. If '
                          'no issues are specified, all branches with mapped '
                          'issues will be listed.')
-  parser.add_option('--json', help='Path to JSON output file.')
+  parser.add_option('--json',
+                    help='Path to JSON output file, or "-" for stdout.')
   _add_codereview_select_options(parser)
   options, args = parser.parse_args(args)
   _process_codereview_select_options(parser, options)
 
   if options.reverse:
     branches = RunGit(['for-each-ref', 'refs/heads',
-                       '--format=%(refname:short)']).splitlines()
-
+                       '--format=%(refname)']).splitlines()
     # Reverse issue lookup.
     issue_branch_map = {}
     for branch in branches:
@@ -3846,21 +4521,24 @@ def CMDissue(parser, args):
           issue, ', '.join(issue_branch_map.get(int(issue)) or ('None',))))
     if options.json:
       write_json(options.json, result)
+    return 0
+
+  if len(args) > 0:
+    issue = ParseIssueNumberArgument(args[0], options.forced_codereview)
+    if not issue.valid:
+      DieWithError('Pass a url or number to set the issue, 0 to unset it, '
+                   'or no argument to list it.\n'
+                   'Maybe you want to run git cl status?')
+    cl = Changelist(codereview=issue.codereview)
+    cl.SetIssue(issue.issue)
   else:
     cl = Changelist(codereview=options.forced_codereview)
-    if len(args) > 0:
-      try:
-        issue = int(args[0])
-      except ValueError:
-        DieWithError('Pass a number to set the issue or none to list it.\n'
-                     'Maybe you want to run git cl status?')
-      cl.SetIssue(issue)
-    print('Issue number: %s (%s)' % (cl.GetIssue(), cl.GetIssueURL()))
-    if options.json:
-      write_json(options.json, {
-        'issue': cl.GetIssue(),
-        'issue_url': cl.GetIssueURL(),
-      })
+  print('Issue number: %s (%s)' % (cl.GetIssue(), cl.GetIssueURL()))
+  if options.json:
+    write_json(options.json, {
+      'issue': cl.GetIssue(),
+      'issue_url': cl.GetIssueURL(),
+    })
   return 0
 
 
@@ -3868,12 +4546,19 @@ def CMDcomments(parser, args):
   """Shows or posts review comments for any changelist."""
   parser.add_option('-a', '--add-comment', dest='comment',
                     help='comment to add to an issue')
-  parser.add_option('-i', dest='issue',
-                    help="review issue id (defaults to current issue)")
+  parser.add_option('-i', '--issue', dest='issue',
+                    help='review issue id (defaults to current issue). '
+                         'If given, requires --rietveld or --gerrit')
+  parser.add_option('-m', '--machine-readable', dest='readable',
+                    action='store_false', default=True,
+                    help='output comments in a format compatible with '
+                         'editor parsing')
   parser.add_option('-j', '--json-file',
-                    help='File to write JSON summary to')
+                    help='File to write JSON summary to, or "-" for stdout')
   auth.add_auth_options(parser)
+  _add_codereview_select_options(parser)
   options, args = parser.parse_args(args)
+  _process_codereview_select_options(parser, options)
   auth_config = auth.extract_auth_config_from_options(options)
 
   issue = None
@@ -3882,41 +4567,42 @@ def CMDcomments(parser, args):
       issue = int(options.issue)
     except ValueError:
       DieWithError('A review issue id is expected to be a number')
+    if not options.forced_codereview:
+      parser.error('--gerrit or --rietveld is required if --issue is specified')
 
-  cl = Changelist(issue=issue, codereview='rietveld', auth_config=auth_config)
+  cl = Changelist(issue=issue,
+                  codereview=options.forced_codereview,
+                  auth_config=auth_config)
 
   if options.comment:
     cl.AddComment(options.comment)
     return 0
 
-  data = cl.GetIssueProperties()
-  summary = []
-  for message in sorted(data.get('messages', []), key=lambda x: x['date']):
-    summary.append({
-        'date': message['date'],
-        'lgtm': False,
-        'message': message['text'],
-        'not_lgtm': False,
-        'sender': message['sender'],
-    })
-    if message['disapproval']:
+  summary = sorted(cl.GetCommentsSummary(readable=options.readable),
+                   key=lambda c: c.date)
+  for comment in summary:
+    if comment.disapproval:
       color = Fore.RED
-      summary[-1]['not lgtm'] = True
-    elif message['approval']:
+    elif comment.approval:
       color = Fore.GREEN
-      summary[-1]['lgtm'] = True
-    elif message['sender'] == data['owner_email']:
+    elif comment.sender == cl.GetIssueOwner():
       color = Fore.MAGENTA
     else:
       color = Fore.BLUE
-    print('\n%s%s  %s%s' % (
-        color, message['date'].split('.', 1)[0], message['sender'],
-        Fore.RESET))
-    if message['text'].strip():
-      print('\n'.join('  ' + l for l in message['text'].splitlines()))
+    print('\n%s%s   %s%s\n%s' % (
+      color,
+      comment.date.strftime('%Y-%m-%d %H:%M:%S UTC'),
+      comment.sender,
+      Fore.RESET,
+      '\n'.join('  ' + l for l in comment.message.strip().splitlines())))
+
   if options.json_file:
+    def pre_serialize(c):
+      dct = c.__dict__.copy()
+      dct['date'] = dct['date'].strftime('%Y-%m-%d %H:%M:%S.%f')
+      return dct
     with open(options.json_file, 'wb') as f:
-      json.dump(summary, f)
+      json.dump(map(pre_serialize, summary), f)
   return 0
 
 
@@ -3939,10 +4625,10 @@ def CMDdescription(parser, args):
 
   target_issue_arg = None
   if len(args) > 0:
-    target_issue_arg = ParseIssueNumberArgument(args[0])
+    target_issue_arg = ParseIssueNumberArgument(args[0],
+                                                options.forced_codereview)
     if not target_issue_arg.valid:
-      parser.print_help()
-      return 1
+      parser.error('invalid codereview url or CL id')
 
   auth_config = auth.extract_auth_config_from_options(options)
 
@@ -3950,14 +4636,23 @@ def CMDdescription(parser, args):
       'auth_config': auth_config,
       'codereview': options.forced_codereview,
   }
+  detected_codereview_from_url = False
   if target_issue_arg:
     kwargs['issue'] = target_issue_arg.issue
     kwargs['codereview_host'] = target_issue_arg.hostname
+    if target_issue_arg.codereview and not options.forced_codereview:
+      detected_codereview_from_url = True
+      kwargs['codereview'] = target_issue_arg.codereview
 
   cl = Changelist(**kwargs)
-
   if not cl.GetIssue():
+    assert not detected_codereview_from_url
     DieWithError('This branch has no associated changelist.')
+
+  if detected_codereview_from_url:
+    logging.info('canonical issue/change URL: %s (type: %s)\n',
+                 cl.GetIssueURL(), target_issue_arg.codereview)
+
   description = ChangeDescription(cl.GetDescription())
 
   if options.display:
@@ -3975,9 +4670,9 @@ def CMDdescription(parser, args):
 
     description.set_description(text)
   else:
-    description.prompt()
+    description.prompt(git_footer=cl.IsGerrit())
 
-  if cl.GetDescription() != description.description:
+  if cl.GetDescription().strip() != description.description:
     cl.UpdateDescription(description.description, force=options.force)
   return 0
 
@@ -4057,6 +4752,8 @@ def CMDpresubmit(parser, args):
                     help='Run upload hook instead of the push hook')
   parser.add_option('-f', '--force', action='store_true',
                     help='Run checks even if tree is dirty')
+  parser.add_option('--all', action='store_true',
+                    help='Run checks against all files, not just modified ones')
   auth.add_auth_options(parser)
   options, args = parser.parse_args(args)
   auth_config = auth.extract_auth_config_from_options(options)
@@ -4072,11 +4769,26 @@ def CMDpresubmit(parser, args):
     # Default to diffing against the common ancestor of the upstream branch.
     base_branch = cl.GetCommonAncestorWithUpstream()
 
+  if options.all:
+    base_change = cl.GetChange(base_branch, None)
+    files = [('M', f) for f in base_change.AllFiles()]
+    change = presubmit_support.GitChange(
+        base_change.Name(),
+        base_change.FullDescriptionText(),
+        base_change.RepositoryRoot(),
+        files,
+        base_change.issue,
+        base_change.patchset,
+        base_change.author_email,
+        base_change._upstream)
+  else:
+    change = cl.GetChange(base_branch, None)
+
   cl.RunHook(
       committing=not options.upload,
       may_prompt=False,
       verbose=options.verbose,
-      change=cl.GetChange(base_branch, None))
+      change=change)
   return 0
 
 
@@ -4122,7 +4834,7 @@ def GetTargetRef(remote, remote_branch, target_branch):
     return None
 
   if target_branch:
-    # Cannonicalize branch references to the equivalent local full symbolic
+    # Canonicalize branch references to the equivalent local full symbolic
     # refs, which are then translated into the remote full symbolic refs
     # below.
     if '/' not in target_branch:
@@ -4173,7 +4885,7 @@ def cleanup_list(l):
   return sorted(filter(None, stripped_items))
 
 
-@subcommand.usage('[args to "git diff"]')
+@subcommand.usage('[flags]')
 def CMDupload(parser, args):
   """Uploads the current changelist to codereview.
 
@@ -4182,13 +4894,23 @@ def CMDupload(parser, args):
   To unset run:
     git config --unset branch.branch_name.skip-deps-uploads
   Can also set the above globally by using the --global flag.
+
+  If the name of the checked out branch starts with "bug-" or "fix-" followed by
+  a bug number, this bug number is automatically populated in the CL
+  description.
+
+  If subject contains text in square brackets or has "<text>: " prefix, such
+  text(s) is treated as Gerrit hashtags. For example, CLs with subjects
+    [git-cl] add support for hashtags
+    Foo bar: implement foo
+  will be hashtagged with "git-cl" and "foo-bar" respectively.
   """
   parser.add_option('--bypass-hooks', action='store_true', dest='bypass_hooks',
                     help='bypass upload presubmit hook')
   parser.add_option('--bypass-watchlists', action='store_true',
                     dest='bypass_watchlists',
                     help='bypass watchlists auto CC-ing reviewers')
-  parser.add_option('-f', action='store_true', dest='force',
+  parser.add_option('-f', '--force', action='store_true', dest='force',
                     help="force yes to questions (don't prompt)")
   parser.add_option('--message', '-m', dest='message',
                     help='message for patchset')
@@ -4202,9 +4924,16 @@ def CMDupload(parser, args):
   parser.add_option('-r', '--reviewers',
                     action='append', default=[],
                     help='reviewer email addresses')
+  parser.add_option('--tbrs',
+                    action='append', default=[],
+                    help='TBR email addresses')
   parser.add_option('--cc',
                     action='append', default=[],
                     help='cc email addresses')
+  parser.add_option('--hashtag', dest='hashtags',
+                    action='append', default=[],
+                    help=('Gerrit hashtag for new CL; '
+                          'can be applied multiple times'))
   parser.add_option('-s', '--send-mail', action='store_true',
                     help='send email to reviewer(s) and cc(s) immediately')
   parser.add_option('--emulate_svn_auto_props',
@@ -4213,25 +4942,23 @@ def CMDupload(parser, args):
                     dest="emulate_svn_auto_props",
                     help="Emulate Subversion's auto properties feature.")
   parser.add_option('-c', '--use-commit-queue', action='store_true',
-                    help='tell the commit queue to commit this patchset')
-  parser.add_option('--private', action='store_true',
-                    help='set the review private (rietveld only)')
+                    help='tell the commit queue to commit this patchset; '
+                          'implies --send-mail')
   parser.add_option('--target_branch',
                     '--target-branch',
                     metavar='TARGET',
                     help='Apply CL to remote ref TARGET.  ' +
                          'Default: remote branch head, or master')
   parser.add_option('--squash', action='store_true',
-                    help='Squash multiple commits into one (Gerrit only)')
+                    help='Squash multiple commits into one')
   parser.add_option('--no-squash', action='store_true',
-                    help='Don\'t squash multiple commits into one ' +
-                         '(Gerrit only)')
+                    help='Don\'t squash multiple commits into one')
   parser.add_option('--topic', default=None,
-                    help='Topic to specify when uploading (Gerrit only)')
-  parser.add_option('--email', default=None,
-                    help='email address to use to connect to Rietveld')
-  parser.add_option('--tbr-owners', dest='tbr_owners', action='store_true',
-                    help='add a set of OWNERS to TBR')
+                    help='Topic to specify when uploading')
+  parser.add_option('--tbr-owners', dest='add_owners_to', action='store_const',
+                    const='TBR', help='add a set of OWNERS to TBR')
+  parser.add_option('--r-owners', dest='add_owners_to', action='store_const',
+                    const='R', help='add a set of OWNERS to R')
   parser.add_option('-d', '--cq-dry-run', dest='cq_dry_run',
                     action='store_true',
                     help='Send the patchset to do a CQ dry run right after '
@@ -4240,8 +4967,13 @@ def CMDupload(parser, args):
                     help='Uploads CLs of all the local branches that depend on '
                          'the current branch')
 
+  # TODO: remove Rietveld flags
+  parser.add_option('--private', action='store_true',
+                    help='set the review private (rietveld only)')
+  parser.add_option('--email', default=None,
+                    help='email address to use to connect to Rietveld')
+
   orig_args = args
-  add_git_similarity(parser)
   auth.add_auth_options(parser)
   _add_codereview_select_options(parser)
   (options, args) = parser.parse_args(args)
@@ -4252,6 +4984,7 @@ def CMDupload(parser, args):
     return 1
 
   options.reviewers = cleanup_list(options.reviewers)
+  options.tbrs = cleanup_list(options.tbrs)
   options.cc = cleanup_list(options.cc)
 
   if options.message_file:
@@ -4263,11 +4996,44 @@ def CMDupload(parser, args):
   if options.cq_dry_run and options.use_commit_queue:
     parser.error('only one of --use-commit-queue and --cq-dry-run allowed.')
 
+  if options.use_commit_queue:
+    options.send_mail = True
+
   # For sanity of test expectations, do this otherwise lazy-loading *now*.
   settings.GetIsGerrit()
 
   cl = Changelist(auth_config=auth_config, codereview=options.forced_codereview)
   return cl.CMDUpload(options, args, orig_args)
+
+
+@subcommand.usage('--description=<description file>')
+def CMDsplit(parser, args):
+  """Splits a branch into smaller branches and uploads CLs.
+
+  Creates a branch and uploads a CL for each group of files modified in the
+  current branch that share a common OWNERS file. In the CL description and
+  comment, the string '$directory', is replaced with the directory containing
+  the shared OWNERS file.
+  """
+  parser.add_option("-d", "--description", dest="description_file",
+                    help="A text file containing a CL description in which "
+                         "$directory will be replaced by each CL's directory.")
+  parser.add_option("-c", "--comment", dest="comment_file",
+                    help="A text file containing a CL comment.")
+  parser.add_option("-n", "--dry-run", dest="dry_run", action='store_true',
+                    default=False,
+                    help="List the files and reviewers for each CL that would "
+                         "be created, but don't create branches or CLs.")
+  options, _ = parser.parse_args(args)
+
+  if not options.description_file:
+    parser.error('No --description flag specified.')
+
+  def WrappedCMDupload(args):
+    return CMDupload(OptionParser(), args)
+
+  return split_cl.SplitCl(options.description_file, options.comment_file,
+                          Changelist, WrappedCMDupload, options.dry_run)
 
 
 @subcommand.usage('DEPRECATED')
@@ -4277,6 +5043,11 @@ def CMDdcommit(parser, args):
              'git-svn. You probably want to use `git cl land` instead.')
   print(message)
   return 1
+
+
+# Two special branches used by git cl land.
+MERGE_BRANCH = 'git-cl-commit'
+CHERRY_PICK_BRANCH = 'git-cl-cherry-pick'
 
 
 @subcommand.usage('[upstream branch to apply against]')
@@ -4296,243 +5067,113 @@ def CMDland(parser, args):
                     help='bypass upload presubmit hook')
   parser.add_option('-m', dest='message',
                     help="override review description")
-  parser.add_option('-f', action='store_true', dest='force',
+  parser.add_option('-f', '--force', action='store_true', dest='force',
                     help="force yes to questions (don't prompt)")
   parser.add_option('-c', dest='contributor',
                     help="external contributor for patch (appended to " +
                          "description and used as author for git). Should be " +
                          "formatted as 'First Last <email@example.com>'")
-  add_git_similarity(parser)
   auth.add_auth_options(parser)
   (options, args) = parser.parse_args(args)
   auth_config = auth.extract_auth_config_from_options(options)
 
   cl = Changelist(auth_config=auth_config)
 
-  # TODO(tandrii): refactor this into _RietveldChangelistImpl method.
-  if cl.IsGerrit():
-    if options.message:
-      # This could be implemented, but it requires sending a new patch to
-      # Gerrit, as Gerrit unlike Rietveld versions messages with patchsets.
-      # Besides, Gerrit has the ability to change the commit message on submit
-      # automatically, thus there is no need to support this option (so far?).
-      parser.error('-m MESSAGE option is not supported for Gerrit.')
-    if options.contributor:
-      parser.error(
-          '-c CONTRIBUTOR option is not supported for Gerrit.\n'
-          'Before uploading a commit to Gerrit, ensure it\'s author field is '
-          'the contributor\'s "name <email>". If you can\'t upload such a '
-          'commit for review, contact your repository admin and request'
-          '"Forge-Author" permission.')
-    if not cl.GetIssue():
-      DieWithError('You must upload the change first to Gerrit.\n'
-                   '  If you would rather have `git cl land` upload '
-                   'automatically for you, see http://crbug.com/642759')
-    return cl._codereview_impl.CMDLand(options.force, options.bypass_hooks,
-                                       options.verbose)
+  if not cl.IsGerrit():
+    parser.error('rietveld is not supported')
 
-  current = cl.GetBranch()
-  remote, upstream_branch = cl.FetchUpstreamTuple(cl.GetBranch())
-  if remote == '.':
-    print()
-    print('Attempting to push branch %r into another local branch!' % current)
-    print()
-    print('Either reparent this branch on top of origin/master:')
-    print('  git reparent-branch --root')
-    print()
-    print('OR run `git rebase-update` if you think the parent branch is ')
-    print('already committed.')
-    print()
-    print('  Current parent: %r' % upstream_branch)
-    return 1
-
-  if not args:
-    # Default to merging against our best guess of the upstream branch.
-    args = [cl.GetUpstreamBranch()]
-
+  if options.message:
+    # This could be implemented, but it requires sending a new patch to
+    # Gerrit, as Gerrit unlike Rietveld versions messages with patchsets.
+    # Besides, Gerrit has the ability to change the commit message on submit
+    # automatically, thus there is no need to support this option (so far?).
+    parser.error('-m MESSAGE option is not supported for Gerrit.')
   if options.contributor:
-    if not re.match('^.*\s<\S+@\S+>$', options.contributor):
-      print("Please provide contibutor as 'First Last <email@example.com>'")
-      return 1
+    parser.error(
+        '-c CONTRIBUTOR option is not supported for Gerrit.\n'
+        'Before uploading a commit to Gerrit, ensure it\'s author field is '
+        'the contributor\'s "name <email>". If you can\'t upload such a '
+        'commit for review, contact your repository admin and request'
+        '"Forge-Author" permission.')
+  if not cl.GetIssue():
+    DieWithError('You must upload the change first to Gerrit.\n'
+                 '  If you would rather have `git cl land` upload '
+                 'automatically for you, see http://crbug.com/642759')
+  return cl._codereview_impl.CMDLand(options.force, options.bypass_hooks,
+                                     options.verbose)
 
-  base_branch = args[0]
 
-  if git_common.is_dirty_git_tree('land'):
-    return 1
+def PushToGitWithAutoRebase(remote, branch, original_description,
+                            git_numberer_enabled, max_attempts=3):
+  """Pushes current HEAD commit on top of remote's branch.
 
-  # This rev-list syntax means "show all commits not in my branch that
-  # are in base_branch".
-  upstream_commits = RunGit(['rev-list', '^' + cl.GetBranchRef(),
-                             base_branch]).splitlines()
-  if upstream_commits:
-    print('Base branch "%s" has %d commits '
-          'not in this branch.' % (base_branch, len(upstream_commits)))
-    print('Run "git merge %s" before attempting to land.' % base_branch)
-    return 1
+  Attempts to fetch and autorebase on push failures.
+  Adds git number footers on the fly.
 
-  merge_base = RunGit(['merge-base', base_branch, 'HEAD']).strip()
-  if not options.bypass_hooks:
-    author = None
-    if options.contributor:
-      author = re.search(r'\<(.*)\>', options.contributor).group(1)
-    hook_results = cl.RunHook(
-        committing=True,
-        may_prompt=not options.force,
-        verbose=options.verbose,
-        change=cl.GetChange(merge_base, author))
-    if not hook_results.should_continue():
-      return 1
+  Returns integer code from last command.
+  """
+  cherry = RunGit(['rev-parse', 'HEAD']).strip()
+  code = 0
+  attempts_left = max_attempts
+  while attempts_left:
+    attempts_left -= 1
+    print('Attempt %d of %d' % (max_attempts - attempts_left, max_attempts))
 
-    # Check the tree status if the tree status URL is set.
-    status = GetTreeStatus()
-    if 'closed' == status:
-      print('The tree is closed.  Please wait for it to reopen. Use '
-            '"git cl land --bypass-hooks" to commit on a closed tree.')
-      return 1
-    elif 'unknown' == status:
-      print('Unable to determine tree status.  Please verify manually and '
-            'use "git cl land --bypass-hooks" to commit on a closed tree.')
-      return 1
+    # Fetch remote/branch into local cherry_pick_branch, overriding the latter.
+    # If fetch fails, retry.
+    print('Fetching %s/%s...' % (remote, branch))
+    code, out = RunGitWithCode(
+        ['retry', 'fetch', remote,
+         '+%s:refs/heads/%s' % (branch, CHERRY_PICK_BRANCH)])
+    if code:
+      print('Fetch failed with exit code %d.' % code)
+      print(out.strip())
+      continue
 
-  change_desc = ChangeDescription(options.message)
-  if not change_desc.description and cl.GetIssue():
-    change_desc = ChangeDescription(cl.GetDescription())
+    print('Cherry-picking commit on top of latest %s' % branch)
+    RunGitWithCode(['checkout', 'refs/heads/%s' % CHERRY_PICK_BRANCH],
+                   suppress_stderr=True)
+    parent_hash = RunGit(['rev-parse', 'HEAD']).strip()
+    code, out = RunGitWithCode(['cherry-pick', cherry])
+    if code:
+      print('Your patch doesn\'t apply cleanly to \'%s\' HEAD @ %s, '
+            'the following files have merge conflicts:' %
+            (branch, parent_hash))
+      print(RunGit(['-c', 'core.quotePath=false', 'diff',
+                    '--name-status', '--diff-filter=U']).strip())
+      print('Please rebase your patch and try again.')
+      RunGitWithCode(['cherry-pick', '--abort'])
+      break
 
-  if not change_desc.description:
-    if not cl.GetIssue() and options.bypass_hooks:
-      change_desc = ChangeDescription(CreateDescriptionFromLog([merge_base]))
-    else:
-      print('No description set.')
-      print('Visit %s/edit to set it.' % (cl.GetIssueURL()))
-      return 1
-
-  # Keep a separate copy for the commit message, because the commit message
-  # contains the link to the Rietveld issue, while the Rietveld message contains
-  # the commit viewvc url.
-  if cl.GetIssue():
-    change_desc.update_reviewers(cl.GetApprovingReviewers())
-
-  commit_desc = ChangeDescription(change_desc.description)
-  if cl.GetIssue():
-    # Xcode won't linkify this URL unless there is a non-whitespace character
-    # after it. Add a period on a new line to circumvent this. Also add a space
-    # before the period to make sure that Gitiles continues to correctly resolve
-    # the URL.
-    commit_desc.append_footer('Review-Url: %s .' % cl.GetIssueURL())
-  if options.contributor:
-    commit_desc.append_footer('Patch from %s.' % options.contributor)
-
-  print('Description:')
-  print(commit_desc.description)
-
-  branches = [merge_base, cl.GetBranchRef()]
-  if not options.force:
-    print_stats(options.similarity, options.find_copies, branches)
-
-  # We want to squash all this branch's commits into one commit with the proper
-  # description. We do this by doing a "reset --soft" to the base branch (which
-  # keeps the working copy the same), then landing that.
-  MERGE_BRANCH = 'git-cl-commit'
-  CHERRY_PICK_BRANCH = 'git-cl-cherry-pick'
-  # Delete the branches if they exist.
-  for branch in [MERGE_BRANCH, CHERRY_PICK_BRANCH]:
-    showref_cmd = ['show-ref', '--quiet', '--verify', 'refs/heads/%s' % branch]
-    result = RunGitWithCode(showref_cmd)
-    if result[0] == 0:
-      RunGit(['branch', '-D', branch])
-
-  # We might be in a directory that's present in this branch but not in the
-  # trunk.  Move up to the top of the tree so that git commands that expect a
-  # valid CWD won't fail after we check out the merge branch.
-  rel_base_path = settings.GetRelativeRoot()
-  if rel_base_path:
-    os.chdir(rel_base_path)
-
-  # Stuff our change into the merge branch.
-  # We wrap in a try...finally block so if anything goes wrong,
-  # we clean up the branches.
-  retcode = -1
-  revision = None
-  try:
-    RunGit(['checkout', '-q', '-b', MERGE_BRANCH])
-    RunGit(['reset', '--soft', merge_base])
-    if options.contributor:
-      RunGit(
-          [
-            'commit', '--author', options.contributor,
-            '-m', commit_desc.description,
-          ])
-    else:
-      RunGit(['commit', '-m', commit_desc.description])
-
-    remote, branch = cl.FetchUpstreamTuple(cl.GetBranch())
-    mirror = settings.GetGitMirror(remote)
-    if mirror:
-      pushurl = mirror.url
-      git_numberer_enabled = _is_git_numberer_enabled(pushurl, branch)
-    else:
-      pushurl = remote  # Usually, this is 'origin'.
-      git_numberer_enabled = _is_git_numberer_enabled(
-          RunGit(['config', 'remote.%s.url' % remote]).strip(), branch)
-
+    commit_desc = ChangeDescription(original_description)
     if git_numberer_enabled:
-      # TODO(tandrii): maybe do autorebase + retry on failure
-      # http://crbug.com/682934, but better just use Gerrit :)
       logging.debug('Adding git number footers')
-      parent_msg = RunGit(['show', '-s', '--format=%B', merge_base]).strip()
-      commit_desc.update_with_git_number_footers(merge_base, parent_msg,
+      parent_msg = RunGit(['show', '-s', '--format=%B', parent_hash]).strip()
+      commit_desc.update_with_git_number_footers(parent_hash, parent_msg,
                                                  branch)
       # Ensure timestamps are monotonically increasing.
-      timestamp = max(1 + _get_committer_timestamp(merge_base),
+      timestamp = max(1 + _get_committer_timestamp(parent_hash),
                       _get_committer_timestamp('HEAD'))
       _git_amend_head(commit_desc.description, timestamp)
-      change_desc = ChangeDescription(commit_desc.description)
 
-    retcode, output = RunGitWithCode(
-        ['push', '--porcelain', pushurl, 'HEAD:%s' % branch])
-    if retcode == 0:
-      revision = RunGit(['rev-parse', 'HEAD']).strip()
-    logging.debug(output)
-  except:  # pylint: disable=bare-except
-    if _IS_BEING_TESTED:
-      logging.exception('this is likely your ACTUAL cause of test failure.\n'
-                        + '-' * 30 + '8<' + '-' * 30)
-      logging.error('\n' + '-' * 30 + '8<' + '-' * 30 + '\n\n\n')
-    raise
-  finally:
-    # And then swap back to the original branch and clean up.
-    RunGit(['checkout', '-q', cl.GetBranch()])
-    RunGit(['branch', '-D', MERGE_BRANCH])
+    code, out = RunGitWithCode(
+        ['push', '--porcelain', remote, 'HEAD:%s' % branch])
+    print(out)
+    if code == 0:
+      break
+    if IsFatalPushFailure(out):
+      print('Fatal push error. Make sure your .netrc credentials and git '
+            'user.email are correct and you have push access to the repo.\n'
+            'Hint: run command below to diangose common Git/Gerrit credential '
+            'problems:\n'
+            '  git cl creds-check\n')
+      break
+  return code
 
-  if not revision:
-    print('Failed to push. If this persists, please file a bug.')
-    return 1
 
-  if cl.GetIssue():
-    viewvc_url = settings.GetViewVCUrl()
-    if viewvc_url and revision:
-      change_desc.append_footer(
-          'Committed: %s%s' % (viewvc_url, revision))
-    elif revision:
-      change_desc.append_footer('Committed: %s' % (revision,))
-    print('Closing issue '
-          '(you may be prompted for your codereview password)...')
-    cl.UpdateDescription(change_desc.description)
-    cl.CloseIssue()
-    props = cl.GetIssueProperties()
-    patch_num = len(props['patchsets'])
-    comment = "Committed patchset #%d (id:%d) manually as %s" % (
-        patch_num, props['patchsets'][-1], revision)
-    if options.bypass_hooks:
-      comment += ' (tree was closed).' if GetTreeStatus() == 'closed' else '.'
-    else:
-      comment += ' (presubmit successful).'
-    cl.RpcServer().add_comment(cl.GetIssue(), comment)
-
-  if os.path.isfile(POSTUPSTREAM_HOOK):
-    RunCommand([POSTUPSTREAM_HOOK, merge_base], error_ok=True)
-
-  return 0
+def IsFatalPushFailure(push_stdout):
+  """True if retrying push won't help."""
+  return '(prohibited by Gerrit)' in push_stdout
 
 
 @subcommand.usage('<patch url or issue id or issue url>')
@@ -4541,9 +5182,9 @@ def CMDpatch(parser, args):
   parser.add_option('-b', dest='newbranch',
                     help='create a new branch off trunk for the patch')
   parser.add_option('-f', '--force', action='store_true',
-                    help='with -b, clobber any existing branch')
+                    help='overwrite state on the current or chosen branch')
   parser.add_option('-d', '--directory', action='store', metavar='DIR',
-                    help='Change to the directory DIR immediately, '
+                    help='change to the directory DIR immediately, '
                          'before doing anything else. Rietveld only.')
   parser.add_option('--reject', action='store_true',
                     help='failed patches spew .rej files rather than '
@@ -4573,7 +5214,6 @@ def CMDpatch(parser, args):
   _process_codereview_select_options(parser, options)
   auth_config = auth.extract_auth_config_from_options(options)
 
-
   if options.reapply:
     if options.newbranch:
       parser.error('--reapply works on the current branch only')
@@ -4599,6 +5239,22 @@ def CMDpatch(parser, args):
   if len(args) != 1 or not args[0]:
     parser.error('Must specify issue number or url')
 
+  target_issue_arg = ParseIssueNumberArgument(args[0],
+                                              options.forced_codereview)
+  if not target_issue_arg.valid:
+    parser.error('invalid codereview url or CL id')
+
+  cl_kwargs = {
+      'auth_config': auth_config,
+      'codereview_host': target_issue_arg.hostname,
+      'codereview': options.forced_codereview,
+  }
+  detected_codereview_from_url = False
+  if target_issue_arg.codereview and not options.forced_codereview:
+    detected_codereview_from_url = True
+    cl_kwargs['codereview'] = target_issue_arg.codereview
+    cl_kwargs['issue'] = target_issue_arg.issue
+
   # We don't want uncommitted changes mixed up with the patch.
   if git_common.is_dirty_git_tree('patch'):
     return 1
@@ -4608,21 +5264,22 @@ def CMDpatch(parser, args):
       RunGit(['branch', '-D', options.newbranch],
              stderr=subprocess2.PIPE, error_ok=True)
     RunGit(['new-branch', options.newbranch])
-  elif not GetCurrentBranch():
-    DieWithError('A branch is required to apply patch. Hint: use -b option.')
 
-  cl = Changelist(auth_config=auth_config, codereview=options.forced_codereview)
+  cl = Changelist(**cl_kwargs)
 
   if cl.IsGerrit():
     if options.reject:
       parser.error('--reject is not supported with Gerrit codereview.')
-    if options.nocommit:
-      parser.error('--nocommit is not supported with Gerrit codereview.')
     if options.directory:
       parser.error('--directory is not supported with Gerrit codereview.')
 
-  return cl.CMDPatchIssue(args[0], options.reject, options.nocommit,
-                          options.directory)
+  if detected_codereview_from_url:
+    print('canonical issue/change URL: %s (type: %s)\n' %
+          (cl.GetIssueURL(), target_issue_arg.codereview))
+
+  return cl.CMDPatchWithParsedIssue(target_issue_arg, options.reject,
+                                    options.nocommit, options.directory,
+                                    options.force)
 
 
 def GetTreeStatus(url=None):
@@ -4681,7 +5338,7 @@ def CMDtry(parser, args):
       help=('Buildbucket bucket to send the try requests.'))
   group.add_option(
       '-m', '--master', default='',
-      help=('Specify a try master where to run the tries.'))
+      help=('DEPRECATED, use -B. The try master where to run the builds.'))
   group.add_option(
       '-r', '--revision',
       help='Revision to use for the try job; default: the revision will '
@@ -4691,6 +5348,8 @@ def CMDtry(parser, args):
       '-c', '--clobber', action='store_true', default=False,
       help='Force a clobber before building; that is don\'t do an '
            'incremental build')
+  group.add_option(
+      '--category', default='git_cl_try', help='Specify custom build category.')
   group.add_option(
       '--project',
       help='Override which project to use. Projects are defined '
@@ -4708,9 +5367,14 @@ def CMDtry(parser, args):
       help='Host of buildbucket. The default host is %default.')
   parser.add_option_group(group)
   auth.add_auth_options(parser)
+  _add_codereview_issue_select_options(parser)
   options, args = parser.parse_args(args)
+  _process_codereview_issue_select_options(parser, options)
   auth_config = auth.extract_auth_config_from_options(options)
 
+  if options.master and options.master.startswith('luci.'):
+    parser.error(
+        '-m option does not support LUCI. Please pass -B %s' % options.master)
   # Make sure that all properties are prop=value pairs.
   bad_params = [x for x in options.properties if '=' not in x]
   if bad_params:
@@ -4719,7 +5383,8 @@ def CMDtry(parser, args):
   if args:
     parser.error('Unknown arguments: %s' % args)
 
-  cl = Changelist(auth_config=auth_config)
+  cl = Changelist(auth_config=auth_config, issue=options.issue,
+                  codereview=options.forced_codereview)
   if not cl.GetIssue():
     parser.error('Need to upload first')
 
@@ -4740,8 +5405,9 @@ def CMDtry(parser, args):
   # then we default to triggering a CQ dry run (see http://crbug.com/625697).
   if not buckets:
     if options.verbose:
-      print('git cl try with no bots now defaults to CQ Dry Run.')
-    return cl.TriggerDryRun()
+      print('git cl try with no bots now defaults to CQ dry run.')
+    print('Scheduling CQ dry run on: %s' % cl.GetIssueURL())
+    return cl.SetCQState(_CQState.DRY_RUN)
 
   for builders in buckets.itervalues():
     if any('triggered' in b for b in builders):
@@ -4763,8 +5429,7 @@ def CMDtry(parser, args):
           (patchset, cl.GetPatchset(), patchset))
 
   try:
-    _trigger_try_jobs(auth_config, cl, buckets, options, 'git_cl_try',
-                      patchset)
+    _trigger_try_jobs(auth_config, cl, buckets, options, patchset)
   except BuildbucketResponseException as ex:
     print('ERROR: %s' % ex)
     return 1
@@ -4785,15 +5450,20 @@ def CMDtry_results(parser, args):
       '--buildbucket-host', default='cr-buildbucket.appspot.com',
       help='Host of buildbucket. The default host is %default.')
   group.add_option(
-      '--json', help='Path of JSON output file to write try job results to.')
+      '--json', help=('Path of JSON output file to write try job results to,'
+                      'or "-" for stdout.'))
   parser.add_option_group(group)
   auth.add_auth_options(parser)
+  _add_codereview_issue_select_options(parser)
   options, args = parser.parse_args(args)
+  _process_codereview_issue_select_options(parser, options)
   if args:
     parser.error('Unrecognized args: %s' % ' '.join(args))
 
   auth_config = auth.extract_auth_config_from_options(options)
-  cl = Changelist(auth_config=auth_config)
+  cl = Changelist(
+      issue=options.issue, codereview=options.forced_codereview,
+      auth_config=auth_config)
   if not cl.GetIssue():
     parser.error('Need to upload first')
 
@@ -4803,7 +5473,7 @@ def CMDtry_results(parser, args):
     if not patchset:
       parser.error('Codereview doesn\'t know about issue %s. '
                    'No access to issue or wrong issue number?\n'
-                   'Either upload first, or pass --patchset explicitely' %
+                   'Either upload first, or pass --patchset explicitly' %
                    cl.GetIssue())
 
     # TODO(tandrii): Checking local patchset against remote patchset is only
@@ -4885,7 +5555,6 @@ def CMDset_commit(parser, args):
   if options.clear:
     state = _CQState.NONE
   elif options.dry_run:
-      # TODO(qyearsley): Use cl.TriggerDryRun.
     state = _CQState.DRY_RUN
   else:
     state = _CQState.COMMIT
@@ -4907,7 +5576,8 @@ def CMDset_close(parser, args):
   cl = Changelist(auth_config=auth_config, issue=options.issue,
                   codereview=options.forced_codereview)
   # Ensure there actually is an issue to close.
-  cl.GetDescription()
+  if not cl.GetIssue():
+    DieWithError('ERROR No issue to close')
   cl.CloseIssue()
   return 0
 
@@ -4925,53 +5595,41 @@ def CMDdiff(parser, args):
   if args:
     parser.error('Unrecognized args: %s' % ' '.join(args))
 
-  # Uncommitted (staged and unstaged) changes will be destroyed by
-  # "git reset --hard" if there are merging conflicts in CMDPatchIssue().
-  # Staged changes would be committed along with the patch from last
-  # upload, hence counted toward the "last upload" side in the final
-  # diff output, and this is not what we want.
-  if git_common.is_dirty_git_tree('diff'):
-    return 1
-
   cl = Changelist(auth_config=auth_config)
   issue = cl.GetIssue()
   branch = cl.GetBranch()
   if not issue:
     DieWithError('No issue found for current branch (%s)' % branch)
-  TMP_BRANCH = 'git-cl-diff'
-  base_branch = cl.GetCommonAncestorWithUpstream()
 
-  # Create a new branch based on the merge-base
-  RunGit(['checkout', '-q', '-b', TMP_BRANCH, base_branch])
-  # Clear cached branch in cl object, to avoid overwriting original CL branch
-  # properties.
-  cl.ClearBranch()
-  try:
-    rtn = cl.CMDPatchIssue(issue, reject=False, nocommit=False, directory=None)
-    if rtn != 0:
-      RunGit(['reset', '--hard'])
-      return rtn
+  base = cl._GitGetBranchConfigValue('last-upload-hash')
+  if not base:
+    base = cl._GitGetBranchConfigValue('gerritsquashhash')
+  if not base:
+    detail = cl._GetChangeDetail(['CURRENT_REVISION', 'CURRENT_COMMIT'])
+    revision_info = detail['revisions'][detail['current_revision']]
+    fetch_info = revision_info['fetch']['http']
+    RunGit(['fetch', fetch_info['url'], fetch_info['ref']])
+    base = 'FETCH_HEAD'
 
-    # Switch back to starting branch and diff against the temporary
-    # branch containing the latest rietveld patch.
-    cmd = ['git', 'diff']
-    if options.stat:
-      cmd.append('--stat')
-    cmd.extend([TMP_BRANCH, branch, '--'])
-    subprocess2.check_call(cmd)
-  finally:
-    RunGit(['checkout', '-q', branch])
-    RunGit(['branch', '-D', TMP_BRANCH])
+  cmd = ['git', 'diff']
+  if options.stat:
+    cmd.append('--stat')
+  cmd.append(base)
+  subprocess2.check_call(cmd)
 
   return 0
 
 
 def CMDowners(parser, args):
-  """Interactively find the owners for reviewing."""
+  """Finds potential owners for reviewing."""
   parser.add_option(
       '--no-color',
       action='store_true',
       help='Use this option to disable color output')
+  parser.add_option(
+      '--batch',
+      action='store_true',
+      help='Do not run interactively, just suggest some')
   auth.add_auth_options(parser)
   options, args = parser.parse_args(args)
   auth_config = auth.extract_auth_config_from_options(options)
@@ -4989,18 +5647,28 @@ def CMDowners(parser, args):
     base_branch = cl.GetCommonAncestorWithUpstream()
 
   change = cl.GetChange(base_branch, None)
+  affected_files = [f.LocalPath() for f in change.AffectedFiles()]
+
+  if options.batch:
+    db = owners.Database(change.RepositoryRoot(), file, os.path)
+    print('\n'.join(db.reviewers_for(affected_files, author)))
+    return 0
+
   return owners_finder.OwnersFinder(
-      [f.LocalPath() for f in
-          cl.GetChange(base_branch, None).AffectedFiles()],
-      change.RepositoryRoot(), author,
+      affected_files,
+      change.RepositoryRoot(),
+      author,
+      cl.GetReviewers(),
       fopen=file, os_path=os.path,
-      disable_color=options.no_color).run()
+      disable_color=options.no_color,
+      override_files=change.OriginalOwnersFiles()).run()
 
 
 def BuildGitDiffCmd(diff_type, upstream_commit, args):
   """Generates a diff command."""
   # Generate diff for the current branch's changes.
-  diff_cmd = ['diff', '--no-ext-diff', '--no-prefix', diff_type,
+  diff_cmd = ['-c', 'core.quotePath=false', 'diff',
+              '--no-ext-diff', '--no-prefix', diff_type,
               upstream_commit, '--']
 
   if args:
@@ -5033,6 +5701,8 @@ def CMDformat(parser, args):
                     help='Format javascript code with clang-format.')
   parser.add_option('--diff', action='store_true',
                     help='Print diff to stdout rather than modifying files.')
+  parser.add_option('--presubmit', action='store_true',
+                    help='Used when running the script from a presubmit.')
   opts, args = parser.parse_args(args)
 
   # Normalize any remaining args against the current path, so paths relative to
@@ -5175,7 +5845,34 @@ def CMDformat(parser, args):
         DieWithError("gn format failed on " + gn_diff_file +
                      "\nTry running 'gn format' on this file manually.")
 
+  # Skip the metrics formatting from the global presubmit hook. These files have
+  # a separate presubmit hook that issues an error if the files need formatting,
+  # whereas the top-level presubmit script merely issues a warning. Formatting
+  # these files is somewhat slow, so it's important not to duplicate the work.
+  if not opts.presubmit:
+    for xml_dir in GetDirtyMetricsDirs(diff_files):
+      tool_dir = os.path.join(top_dir, xml_dir)
+      cmd = [os.path.join(tool_dir, 'pretty_print.py'), '--non-interactive']
+      if opts.dry_run or opts.diff:
+        cmd.append('--diff')
+      stdout = RunCommand(cmd, cwd=top_dir)
+      if opts.diff:
+        sys.stdout.write(stdout)
+      if opts.dry_run and stdout:
+        return_value = 2  # Not formatted.
+
   return return_value
+
+def GetDirtyMetricsDirs(diff_files):
+  xml_diff_files = [x for x in diff_files if MatchingFileType(x, ['.xml'])]
+  metrics_xml_dirs = [
+    os.path.join('tools', 'metrics', 'actions'),
+    os.path.join('tools', 'metrics', 'histograms'),
+    os.path.join('tools', 'metrics', 'rappor'),
+    os.path.join('tools', 'metrics', 'ukm')]
+  for xml_dir in metrics_xml_dirs:
+    if any(file.startswith(xml_dir) for file in xml_diff_files):
+      yield xml_dir
 
 
 @subcommand.usage('<codereview url or issue id>')
@@ -5189,8 +5886,8 @@ def CMDcheckout(parser, args):
 
   issue_arg = ParseIssueNumberArgument(args[0])
   if not issue_arg.valid:
-    parser.print_help()
-    return 1
+    parser.error('invalid codereview url or CL id')
+
   target_issue = str(issue_arg.issue)
 
   def find_issues(issueprefix):

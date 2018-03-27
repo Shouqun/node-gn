@@ -9,6 +9,7 @@ import cPickle
 import functools
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -261,7 +262,8 @@ class _Drover(object):
     # Files that have been deleted between branch and cherry-pick will not have
     # their skip-worktree bit set so set it manually for those files to avoid
     # git status incorrectly listing them as unstaged deletes.
-    repo_status = self._run_git_command(['status', '--porcelain']).splitlines()
+    repo_status = self._run_git_command(
+        ['-c', 'core.quotePath=false', 'status', '--porcelain']).splitlines()
     extra_files = [f[3:] for f in repo_status if f[:2] == ' D']
     if extra_files:
       self._run_git_command_with_stdin(
@@ -274,7 +276,9 @@ class _Drover(object):
       return True
 
     self._run_git_command(['reset', '--hard'])
-    self._run_git_command(['cl', 'upload'],
+
+    author = self._run_git_command(['log', '-1', '--format=%ae']).strip()
+    self._run_git_command(['cl', 'upload', '--send-mail', '--tbrs', author],
                           error_message='Upload failed',
                           interactive=True)
 
@@ -293,6 +297,9 @@ class _Drover(object):
       interactive: A bool containing whether the command requires user
           interaction. If false, the command will be provided with no input and
           the output is captured.
+
+    Returns:
+      stdout as a string, or stdout interleaved with stderr if self._verbose
 
     Raises:
       Error: The command failed to complete successfully.
@@ -320,6 +327,9 @@ class _Drover(object):
     Args:
       args: A list of strings containing the args to pass to git.
       stdin: A string to provide on stdin.
+
+    Returns:
+      stdout as a string, or stdout interleaved with stderr if self._verbose
 
     Raises:
       Error: The command failed to complete successfully.

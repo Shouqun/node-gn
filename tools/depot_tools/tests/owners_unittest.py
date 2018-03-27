@@ -18,6 +18,7 @@ import owners
 ben = 'ben@example.com'
 brett = 'brett@example.com'
 darin = 'darin@example.com'
+jochen = 'jochen@example.com'
 john = 'john@example.com'
 ken = 'ken@example.com'
 peter = 'peter@example.com'
@@ -32,7 +33,8 @@ def owners_file(*email_addresses, **kwargs):
     s += 'set noparent\n'
   if kwargs.get('file'):
     s += 'file:%s\n' % kwargs.get('file')
-  s += '\n'.join(kwargs.get('lines', [])) + '\n'
+  if kwargs.get('lines'):
+    s += '\n'.join(kwargs.get('lines', [])) + '\n'
   return s + '\n'.join(email_addresses) + '\n'
 
 
@@ -78,6 +80,7 @@ class _BaseTestCase(unittest.TestCase):
     root = root or self.root
     fopen = fopen or self.fopen
     os_path = os_path or self.repo
+    # pylint: disable=no-value-for-parameter
     return owners.Database(root, fopen, os_path)
 
 
@@ -284,6 +287,19 @@ class OwnersDatabaseTest(_BaseTestCase):
     self.files['/content/baz/OWNERS'] = owners_file(file='//chrome/gpu/OWNERS')
     self.assert_files_not_covered_by(['content/qux/foo.cc'], [ken], [])
 
+  def test_file_include_different_filename(self):
+    # This tests that a file named something other than OWNERS is not treated
+    # like OWNERS; we want to make sure that ken and peter don't become owners
+    # for /content, and that other owners for content still work.
+    self.files['/content/baz/OWNERS'] = owners_file(file='//content/BAZ_OWNERS')
+    self.files['/content/BAZ_OWNERS'] = owners_file([ken, peter])
+    self.assert_files_not_covered_by(
+        ['content/baz/baz.cc', 'content/qux/foo.cc'],
+        [ken], ['content/qux/foo.cc'])
+    self.assert_files_not_covered_by(
+        ['content/baz/baz.cc', 'content/qux/foo.cc'],
+        [ken, john], [])
+
   def test_file_include_recursive_loop(self):
     self.files['/content/baz/OWNERS'] = owners_file(brett,
         file='//content/qux/OWNERS')
@@ -321,11 +337,47 @@ class OwnersDatabaseTest(_BaseTestCase):
   def test_syntax_error__invalid_relative_file(self):
     self.assert_syntax_error('file:foo/bar/baz\n')
 
+  def test_non_existant_status_file(self):
+    db = self.db()
+    self.files['/OWNERS'] = owners_file(brett,
+                                        comment='OWNERS_STATUS = nonexistant')
+    self.files['/foo/DEPS'] = ''
+    self.assertRaises(IOError, db.reviewers_for, ['foo/DEPS'], None)
+
+  def test_comment_to_owners_mapping(self):
+    db = self.db()
+    self.files['/OWNERS'] = '\n'.join([
+        '# first comment',
+        ben,
+        brett,
+        '',
+        darin,
+        '',
+        '# comment preceeded by empty line',
+        'per-file bar.*=%s' % jochen,
+        john,
+        '',
+        ken,
+        '# comment in the middle',
+        peter,
+        tom])
+    # Force loading of the OWNERS file.
+    self.files['/bar.cc'] = ''
+    db.reviewers_for(['bar.cc'], None)
+
+    self.assertEqual(db.comments, {
+        ben: {'': 'first comment'},
+        brett: {'': 'first comment'},
+        jochen: {'bar.*': 'comment preceeded by empty line'},
+        john: {'': 'comment preceeded by empty line'},
+        peter: {'': 'comment in the middle'}})
+
 
 class ReviewersForTest(_BaseTestCase):
   def assert_reviewers_for(self, files, potential_suggested_reviewers,
-                           author=None):
+                           author=None, override_files=None):
     db = self.db()
+    db.override_files = override_files or {}
     suggested_reviewers = db.reviewers_for(set(files), author)
     self.assertTrue(suggested_reviewers in
         [set(suggestion) for suggestion in potential_suggested_reviewers])
@@ -415,6 +467,13 @@ class ReviewersForTest(_BaseTestCase):
     self.assert_reviewers_for(['chrome/gpu/gpu_channel.h'],
                               [[ben], [brett]], author=ken)
 
+
+  def test_reviewers_for__ignores_unowned_files(self):
+    # Clear the root OWNERS file.
+    self.files['/OWNERS'] = ''
+    self.assert_reviewers_for(['base/vlog.h', 'chrome/browser/deafults/h'],
+                              [[brett]])
+
   def test_reviewers_file_includes__absolute(self):
     self.assert_reviewers_for(['content/qux/foo.cc'],
                               [[peter], [brett], [john], [darin]])
@@ -441,6 +500,16 @@ class ReviewersForTest(_BaseTestCase):
                               [[peter]])
     self.assert_reviewers_for(['content/garply/bar.cc'],
                               [[brett]])
+
+  def test_override_files(self):
+      self.assert_reviewers_for(['content/baz/froboz.h'], [[jochen]],
+                                override_files={'content/baz/OWNERS': [jochen]})
+      self.assert_reviewers_for(['content/baz/froboz.h'], [[john],[darin]],
+                                override_files={'content/baz/OWNERS': []})
+      self.assert_reviewers_for(
+          ['content/baz/froboz.h'], [[jochen]],
+          override_files={'content/baz/OWNERS': ['file://JOCHEN_OWNERS'],
+                          'JOCHEN_OWNERS': [jochen]})
 
 
 class LowestCostOwnersTest(_BaseTestCase):

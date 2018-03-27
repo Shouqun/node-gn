@@ -1373,6 +1373,10 @@ class GitVCS(VersionControlSystem):
     self.renames = {}
 
   def GetGUID(self):
+    remote, retcode = RunShellWithReturnCode(
+        "git config remote.origin.url".split())
+    if not retcode:
+      return remote.strip()
     revlist = RunShell("git rev-list --parents HEAD".split()).splitlines()
     # M-A: Return the 1st root hash, there could be multiple when a
     # subtree is merged. In that case, more analysis would need to
@@ -2156,6 +2160,10 @@ def GuessVCSName(options):
         return (vcs_type, out.strip())
     except OSError as e:
       if e.errno != errno.ENOENT:  # command not found code
+        raise
+    except ValueError as e:
+      # Workaround for https://bugs.python.org/issue26083
+      if e.message != "insecure string pickle":
         raise
 
   # Mercurial has a command to get the base directory of a repository

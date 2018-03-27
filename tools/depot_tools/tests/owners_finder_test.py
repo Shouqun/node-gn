@@ -21,10 +21,12 @@ import owners
 ben = 'ben@example.com'
 brett = 'brett@example.com'
 darin = 'darin@example.com'
+jochen = 'jochen@example.com'
 john = 'john@example.com'
 ken = 'ken@example.com'
 peter = 'peter@example.com'
 tom = 'tom@example.com'
+nonowner = 'nonowner@example.com'
 
 
 def owners_file(*email_addresses, **kwargs):
@@ -33,14 +35,15 @@ def owners_file(*email_addresses, **kwargs):
     s += '# %s\n' % kwargs.get('comment')
   if kwargs.get('noparent'):
     s += 'set noparent\n'
-  s += '\n'.join(kwargs.get('lines', [])) + '\n'
   return s + '\n'.join(email_addresses) + '\n'
 
 
 def test_repo():
   return filesystem_mock.MockFileSystem(files={
     '/DEPS': '',
-    '/OWNERS': owners_file(ken, peter, tom),
+    '/OWNERS': owners_file(ken, peter, tom,
+                           comment='OWNERS_STATUS = build/OWNERS.status'),
+    '/build/OWNERS.status': '%s: bar' % jochen,
     '/base/vlog.h': '',
     '/chrome/OWNERS': owners_file(ben, brett),
     '/chrome/browser/OWNERS': owners_file(brett),
@@ -57,6 +60,10 @@ def test_repo():
     '/content/baz/froboz.h': '',
     '/content/baz/ugly.cc': '',
     '/content/baz/ugly.h': '',
+    '/content/common/OWNERS': owners_file(jochen),
+    '/content/common/common.cc': '',
+    '/content/foo/OWNERS': owners_file(jochen, comment='foo'),
+    '/content/foo/foo.cc': '',
     '/content/views/OWNERS': owners_file(ben, john, owners.EVERYONE,
                                          noparent=True),
     '/content/views/pie.h': '',
@@ -64,11 +71,11 @@ def test_repo():
 
 
 class OutputInterceptedOwnersFinder(owners_finder.OwnersFinder):
-  def __init__(self, files, local_root,
+  def __init__(self, files, local_root, author, reviewers,
                fopen, os_path, disable_color=False):
     super(OutputInterceptedOwnersFinder, self).__init__(
-      files, local_root, None,
-      fopen, os_path, disable_color=disable_color)
+      files, local_root, author, reviewers, fopen, os_path,
+      disable_color=disable_color)
     self.output = []
     self.indentation_stack = []
 
@@ -108,8 +115,12 @@ class _BaseTestCase(unittest.TestCase):
     self.root = '/'
     self.fopen = self.repo.open_for_reading
 
-  def ownersFinder(self, files):
-    finder = OutputInterceptedOwnersFinder(files, self.root,
+  def ownersFinder(self, files, author=nonowner, reviewers=None):
+    reviewers = reviewers or []
+    finder = OutputInterceptedOwnersFinder(files,
+                                           self.root,
+                                           author,
+                                           reviewers,
                                            fopen=self.fopen,
                                            os_path=self.repo,
                                            disable_color=True)
@@ -122,6 +133,22 @@ class _BaseTestCase(unittest.TestCase):
 class OwnersFinderTests(_BaseTestCase):
   def test_constructor(self):
     self.assertNotEquals(self.defaultFinder(), None)
+
+  def test_skip_files_owned_by_reviewers(self):
+    files = [
+        'chrome/browser/defaults.h',  # owned by brett
+        'content/bar/foo.cc',         # not owned by brett
+    ]
+    finder = self.ownersFinder(files, reviewers=[brett])
+    self.assertEqual(finder.unreviewed_files, {'content/bar/foo.cc'})
+
+  def test_skip_files_owned_by_author(self):
+    files = [
+        'chrome/browser/defaults.h',  # owned by brett
+        'content/bar/foo.cc',         # not owned by brett
+    ]
+    finder = self.ownersFinder(files, author=brett)
+    self.assertEqual(finder.unreviewed_files, {'content/bar/foo.cc'})
 
   def test_reset(self):
     finder = self.defaultFinder()
@@ -232,6 +259,17 @@ class OwnersFinderTests(_BaseTestCase):
     self.assertEqual(finder.output,
                      [darin + ' is commented as:', ['foo (at content)']])
 
+  def test_print_global_comments(self):
+    finder = self.ownersFinder(['content/common/common.cc'])
+    finder.print_comments(jochen)
+    self.assertEqual(finder.output,
+                     [jochen + ' is commented as:', ['bar (global status)']])
+
+    finder = self.ownersFinder(['content/foo/foo.cc'])
+    finder.print_comments(jochen)
+    self.assertEqual(finder.output,
+                     [jochen + ' is commented as:', ['bar (global status)',
+                                                     'foo (at content/foo)']])
 
 if __name__ == '__main__':
   unittest.main()

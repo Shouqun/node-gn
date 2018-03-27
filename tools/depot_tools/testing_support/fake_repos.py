@@ -15,6 +15,7 @@ import re
 import socket
 import sys
 import tempfile
+import textwrap
 import time
 
 # trial_dir must be first for non-system libraries.
@@ -134,7 +135,7 @@ def wait_for_port_to_free(host, port):
 class FakeReposBase(object):
   """Generate git repositories to test gclient functionality.
 
-  Many DEPS functionalities need to be tested: Var, File, From, deps_os, hooks,
+  Many DEPS functionalities need to be tested: Var, deps_os, hooks,
   use_relative_paths.
 
   And types of dependencies: Relative urls, Full urls, git.
@@ -270,6 +271,10 @@ class FakeReposBase(object):
     self.git_dirty = False
     return True
 
+  def _git_rev_parse(self, path):
+    return subprocess2.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=path).strip()
+
   def _commit_git(self, repo, tree):
     repo_root = join(self.git_root, repo)
     self._genTree(repo_root, tree)
@@ -280,6 +285,12 @@ class FakeReposBase(object):
     else:
       new_tree = tree.copy()
     self.git_hashes[repo].append((commit_hash, new_tree))
+
+  def _fast_import_git(self, repo, data):
+    repo_root = join(self.git_root, repo)
+    logging.debug('%s: fast-import %s', repo, data)
+    subprocess2.check_call(
+        ['git', 'fast-import', '--quiet'], cwd=repo_root, stdin=data)
 
   def check_port_is_free(self, port):
     sock = socket.socket()
@@ -298,7 +309,7 @@ class FakeReposBase(object):
 
 class FakeRepos(FakeReposBase):
   """Implements populateGit()."""
-  NB_GIT_REPOS = 5
+  NB_GIT_REPOS = 14
 
   def populateGit(self):
     # Testing:
@@ -309,11 +320,7 @@ class FakeRepos(FakeReposBase):
     # - deps_os
     # - var
     # - hooks
-    # - From
     # TODO(maruel):
-    # - File: File is hard to test here because it's SVN-only. It's
-    #         implementation should probably be replaced to use urllib instead.
-    # - $matching_files
     # - use_relative_paths
     self._commit_git('repo_3', {
       'origin': 'git/repo_3@1\n',
@@ -327,10 +334,35 @@ class FakeRepos(FakeReposBase):
       'DEPS': """
 vars = {
   'DummyVariable': 'repo',
+  'false_var': False,
+  'false_str_var': 'False',
+  'true_var': True,
+  'true_str_var': 'True',
+  'str_var': 'abc',
+  'cond_var': 'false_str_var and true_var',
 }
+# Nest the args file in a sub-repo, to make sure we don't try to
+# write it before we've cloned everything.
+gclient_gn_args_file = 'src/repo2/gclient.args'
+gclient_gn_args = [
+  'false_var',
+  'false_str_var',
+  'true_var',
+  'true_str_var',
+  'str_var',
+  'cond_var',
+]
 deps = {
-  'src/repo2': '%(git_base)srepo_2',
+  'src/repo2': {
+    'url': '%(git_base)srepo_2',
+    'condition': 'True',
+  },
   'src/repo2/repo3': '/' + Var('DummyVariable') + '_3@%(hash3)s',
+  # Test that deps where condition evaluates to False are skipped.
+  'src/repo5': {
+    'url': '/repo_5',
+    'condition': 'False',
+  },
 }
 deps_os = {
   'mac': {
@@ -372,8 +404,7 @@ deps = {
       'DEPS': """
 deps = {
   'src/repo2': '%(git_base)srepo_2@%(hash)s',
-  #'src/repo2/repo_renamed': '/repo_3',
-  'src/repo2/repo_renamed': From('src/repo2', 'foo/bar'),
+  'src/repo2/repo_renamed': '/repo_3',
 }
 # I think this is wrong to have the hooks run from the base of the gclient
 # checkout. It's maybe a bit too late to change that behavior.
@@ -447,6 +478,242 @@ pre_deps_hooks = [
          'hash2': self.git_hashes['repo_2'][1][0][:7],
       },
     'origin': 'git/repo_5@3\n',
+    })
+
+    self._commit_git('repo_6', {
+      'DEPS': """
+vars = {
+  'DummyVariable': 'repo',
+  'git_base': '%(git_base)s',
+  'hook1_contents': 'git_hooked1',
+  'repo5_var': '/repo_5',
+
+  'false_var': False,
+  'false_str_var': 'False',
+  'true_var': True,
+  'true_str_var': 'True',
+  'str_var': 'abc',
+  'cond_var': 'false_str_var and true_var',
+}
+
+gclient_gn_args_file = 'src/repo2/gclient.args'
+gclient_gn_args = [
+  'false_var',
+  'false_str_var',
+  'true_var',
+  'true_str_var',
+  'str_var',
+  'cond_var',
+]
+
+allowed_hosts = [
+  '%(git_base)s',
+]
+deps = {
+  'src/repo2': {
+    'url': Var('git_base') + 'repo_2@%(hash)s',
+    'condition': 'true_str_var',
+  },
+  'src/repo4': {
+    'url': '/repo_4',
+    'condition': 'False',
+  },
+  'src/repo8': '/repo_8',
+}
+deps_os ={
+  'mac': {
+    # This entry should not appear in flattened DEPS' |deps|.
+    'src/mac_repo': '{repo5_var}',
+  },
+  'unix': {
+    # This entry should not appear in flattened DEPS' |deps|.
+    'src/unix_repo': '{repo5_var}',
+  },
+  'win': {
+    # This entry should not appear in flattened DEPS' |deps|.
+    'src/win_repo': '{repo5_var}',
+  },
+}
+hooks = [
+  {
+    'pattern': '.',
+    'condition': 'True',
+    'action': ['python', '-c',
+               'open(\\'src/git_hooked1\\', \\'w\\').write(\\'{hook1_contents}\\')'],
+  },
+  {
+    # Should not be run.
+    'pattern': 'nonexistent',
+    'action': ['python', '-c',
+               'open(\\'src/git_hooked2\\', \\'w\\').write(\\'git_hooked2\\')'],
+  },
+]
+hooks_os = {
+  'mac': [
+    {
+      'pattern': '.',
+      'action': ['python', '-c',
+                 'open(\\'src/git_hooked_mac\\', \\'w\\').write('
+                     '\\'git_hooked_mac\\')'],
+    },
+  ],
+}
+recursedeps = [
+  'src/repo2',
+  'src/repo8',
+]""" % {
+        'git_base': self.git_base,
+        'hash': self.git_hashes['repo_2'][1][0][:7]
+      },
+      'origin': 'git/repo_6@1\n',
+    })
+
+    self._commit_git('repo_7', {
+      'DEPS': """
+vars = {
+  'true_var': 'True',
+  'false_var': 'true_var and False',
+}
+hooks = [
+  {
+    'action': ['python', '-c',
+               'open(\\'src/should_run\\', \\'w\\').write(\\'should_run\\')'],
+    'condition': 'true_var or True',
+  },
+  {
+    'action': ['python', '-c',
+               'open(\\'src/should_not_run\\', \\'w\\').write(\\'should_not_run\\')'],
+    'condition': 'false_var',
+  },
+]""",
+      'origin': 'git/repo_7@1\n',
+    })
+
+    self._commit_git('repo_8', {
+      'DEPS': """
+deps_os ={
+  'mac': {
+    'src/recursed_os_repo': '/repo_5',
+  },
+  'unix': {
+    'src/recursed_os_repo': '/repo_5',
+  },
+}""",
+      'origin': 'git/repo_8@1\n',
+    })
+
+    self._commit_git('repo_9', {
+      'DEPS': """
+deps = {
+  'src/repo8': '/repo_8',
+
+  # This entry should appear in flattened file,
+  # but not recursed into, since it's not
+  # in recursedeps.
+  'src/repo7': '/repo_7',
+}
+deps_os = {
+  'android': {
+    # This entry should only appear in flattened |deps_os|,
+    # not |deps|, even when used with |recursedeps|.
+    'src/repo4': '/repo_4',
+  }
+}
+recursedeps = [
+  'src/repo4',
+  'src/repo8',
+]""",
+      'origin': 'git/repo_9@1\n',
+    })
+
+    self._commit_git('repo_10', {
+      'DEPS': """
+deps = {
+  'src/repo9': '/repo_9',
+
+  # This entry should appear in flattened file,
+  # but not recursed into, since it's not
+  # in recursedeps.
+  'src/repo6': '/repo_6',
+}
+deps_os = {
+  'mac': {
+    'src/repo11': '/repo_11',
+  },
+  'ios': {
+    'src/repo11': '/repo_11',
+  }
+}
+recursedeps = [
+  'src/repo9',
+  'src/repo11',
+]""",
+      'origin': 'git/repo_10@1\n',
+    })
+
+    self._commit_git('repo_11', {
+      'DEPS': """
+deps = {
+  'src/repo12': '/repo_12',
+}""",
+      'origin': 'git/repo_11@1\n',
+    })
+
+    self._commit_git('repo_12', {
+      'origin': 'git/repo_12@1\n',
+    })
+
+    self._fast_import_git('repo_12', """blob
+mark :1
+data 6
+Hello
+
+blob
+mark :2
+data 4
+Bye
+
+reset refs/changes/1212
+commit refs/changes/1212
+mark :3
+author Bob <bob@example.com> 1253744361 -0700
+committer Bob <bob@example.com> 1253744361 -0700
+data 8
+A and B
+M 100644 :1 a
+M 100644 :2 b
+""")
+
+    self._commit_git('repo_13', {
+      'DEPS': """
+deps = {
+  'src/repo12': '/repo_12',
+}""",
+      'origin': 'git/repo_13@1\n',
+    })
+
+    self._commit_git('repo_13', {
+      'DEPS': """
+deps = {
+  'src/repo12': '/repo_12@refs/changes/1212',
+}""",
+      'origin': 'git/repo_13@2\n',
+    })
+
+    self._commit_git('repo_14', {
+      'DEPS': textwrap.dedent("""\
+        deps = {
+          'src/cipd_dep': {
+            'packages': [
+              {
+                'package': 'package0',
+                'version': '0.1',
+              },
+            ],
+            'dep_type': 'cipd',
+          },
+        }"""),
+      'origin': 'git/repo_14@2\n'
     })
 
 
@@ -598,6 +865,10 @@ class FakeReposTestBase(trial_dir.TestCase):
   def gittree(self, repo, rev):
     """Sort-hand: returns the directory tree for a git 'revision'."""
     return self.FAKE_REPOS.git_hashes[repo][int(rev)][1]
+
+  def gitrevparse(self, repo):
+    """Returns the actual revision for a given repo."""
+    return self.FAKE_REPOS._git_rev_parse(repo)
 
 
 def main(argv):

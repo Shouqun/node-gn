@@ -72,7 +72,7 @@ class Rietveld(object):
     logging.info('closing issue %d' % issue)
     self.post("/%d/close" % issue, [('xsrf_token', self.xsrf_token())])
 
-  def get_description(self, issue):
+  def get_description(self, issue, force=False):
     """Returns the issue's description.
 
     Converts any CRLF into LF and strip extraneous whitespace.
@@ -93,7 +93,7 @@ class Rietveld(object):
     url = '/%d/patchset/%d/get_depends_on_patchset' % (issue, patchset)
     resp = None
     try:
-      resp = json.loads(self.post(url, []))
+      resp = json.loads(self.get(url))
     except (urllib2.HTTPError, ValueError):
       # The get_depends_on_patchset endpoint does not exist on this Rietveld
       # instance yet. Ignore the error and proceed.
@@ -310,6 +310,13 @@ class Rietveld(object):
       'private': private,
       'commit': commit,
     }
+    # The integer values were determined by checking HTML source of Rietveld on
+    # https://codereview.chromium.org/search. See also http://crbug.com/712060.
+    three_state_value_map = {
+        None: 1,   # Unknown.
+        True: 2,   # Yes.
+        False: 3,  # No.
+    }
 
     url = '/search?format=json'
     # Sort the keys mainly to ease testing.
@@ -320,7 +327,7 @@ class Rietveld(object):
     for key in sorted(three_state_keys):
       value = three_state_keys[key]
       if value is not None:
-        url += '&%s=%s' % (key, value)
+        url += '&%s=%d' % (key, three_state_value_map[value])
 
     if keys_only:
       url += '&keys_only=True'
@@ -654,11 +661,14 @@ class CachingRietveld(Rietveld):
       function_cache[args] = update(*args)
     return copy.deepcopy(function_cache[args])
 
-  def get_description(self, issue):
-    return self._lookup(
-        'get_description',
-        (issue,),
-        super(CachingRietveld, self).get_description)
+  def get_description(self, issue, force=False):
+    if force:
+      return super(CachingRietveld, self).get_description(issue, force=force)
+    else:
+      return self._lookup(
+          'get_description',
+          (issue,),
+          super(CachingRietveld, self).get_description)
 
   def get_issue_properties(self, issue, messages):
     """Returns the issue properties.
