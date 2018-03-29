@@ -7,6 +7,6 @@ process.title = 'gn-node'
 
 var argv = process.argv;
 
-gn_module = gn();
+gnModule= gn();
 
-gn_module.run_gn(process.argv);
+gnModule.runGN(process.argv);
