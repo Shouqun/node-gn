@@ -20,6 +20,7 @@ default_compiler_configs = [
 
 set_defaults("shared_library") {
   configs = default_compiler_configs
+  output_extension = "node"
 }
 
 set_default_toolchain("//buildconfig/toolchain/$host_os:$host_os")
