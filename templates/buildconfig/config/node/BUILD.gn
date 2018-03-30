@@ -9,9 +9,17 @@ config("node_include_dirs") {
 
 config("node_cxx_flags") {
   cflags_cc = [ "-std=c++11" ]
+
+  if (target_os == "linux" || target_os == "android") {
+    cflags_cc += [ "-fPIC" ]
+  }
 }
 
 config("node_ld_flags") {
-  ldflags = [ "-undefined" ]
-  ldflags += [ "dynamic_lookup" ]
+  ldflags = []
+
+  if (target_os == "mac") {
+    ldflags += [ "-undefined" ]
+    ldflags += [ "dynamic_lookup" ]
+  }
 }
