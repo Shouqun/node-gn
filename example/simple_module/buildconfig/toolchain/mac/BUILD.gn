@@ -1,0 +1,78 @@
+toolchain("mac") {
+  object_subdir = "{{target_out_dir}}/{{label_name}}"
+
+  cc = "gcc"
+  cxx = "g++"
+  ar = "ar"
+  ld = cxx
+
+  tool("cc") {
+    depfile = "{{output}}.d"
+    command = "$cc -MMD -MF $depfile {{defines}} {{include_dirs}} {{cflags}} {{cflags_c}} -c {{source}} -o {{output}}"
+    depsformat = "gcc"
+    description = "CC {{output}}"
+    outputs = [
+      "$object_subdir/{{source_name_part}}.o"
+    ]
+  }
+
+  tool("cxx") {
+    depfile = "{{output}}.d"
+    command = "$cxx -MMD -MF $depfile {{defines}} {{include_dirs}} {{cflags_c}} {{cflags_cc}} -c {{source}} -o {{output}}"
+    depsformat = "gcc"
+    description = "CC {{output}}"
+    outputs = [
+      "$object_subdir/{{source_name_part}}.o"
+    ]
+  }
+
+  tool("alink") {
+    command = "rm -f {{output}} && $ar rcs {{output}} {{inputs}}"
+    description = "AR {{output}}"
+    outputs = [
+      "{{target_out_dir}}/{{target_output_name}}{{output_extension}}",
+    ]
+    default_output_extension = ".a"
+    output_prefix = "lib"
+  }
+
+  tool("link") {
+    outputs = [
+      "{{root_out_dir}}/{{target_output_name}}{{output_extension}}",
+    ]
+    command = "$ld {{ldflags}} -o {{output}} {{inputs}} {{solibs}} {{libs}}"
+    description = "LINK {{output}}"
+  }
+
+  tool("solink") {
+    dylib = "{{root_out_dir}}/{{target_output_name}}{{output_extension}}"
+    rspfile = dylib + ".rsp"
+    tocname = dylib + ".TOC"
+    temporary_tocname = dylib + ".tmp"
+
+    does_reexport_command = "[ ! -e \"$dylib\" -o ! -e \"$tocname\" ] || otool -l \"$dylib\" | grep -q LC_REEXPORT_DYLIB"
+    link_command = "$ld -shared -Wl,-install_name,@rpath/\"{{target_output_name}}{{output_extension}}\""
+    link_command += " {{ldflags}} -o \"$dylib\" -Wl,-filelist,\"$rspfile\" {{libs}} {{solibs}}"
+
+    replace_command = "if ! cmp -s \"$temporary_tocname\" \"$tocname\"; then mv \"$temporary_tocname\" \"$tocname\""
+    extract_toc_command = "{ otool -l \"$dylib\" | grep LC_ID_DYLIB -A 5; nm -gP \"$dylib\" | cut -f1-2 -d' ' | grep -v U\$\$; true; }"
+
+    command = "if $does_reexport_command ; then $link_command && $extract_toc_command > \"$tocname\"; else $link_command && $extract_toc_command > \"$temporary_tocname\" && $replace_command ; fi; fi"
+
+    rspfile_content = "{{inputs_newline}}"
+
+    description = "LINK {{output}}"
+
+    default_output_dir = "{{root_out_dir}}"
+    default_output_extension = ".dylib"
+    output_prefix = "lib"
+
+    restat = true
+    outputs = [
+      dylib,
+      tocname,
+    ]
+    link_output = dylib
+    depend_output = tocname
+  }
+}

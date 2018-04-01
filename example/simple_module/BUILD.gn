@@ -1,0 +1,5 @@
+shared_library("hello") {
+  sources = [
+    "hello.cc",
+  ]
+}

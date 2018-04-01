@@ -1,0 +1,26 @@
+if (target_os == "") {
+  target_os = host_os
+}
+
+if (target_cpu == "") {
+  target_cpu = host_cpu
+}
+
+
+declare_args() {
+  host_toolchain = ""
+  node_root_dir = ""
+}
+
+default_compiler_configs = [
+  "//buildconfig/config/node:node_include_dirs",
+  "//buildconfig/config/node:node_cxx_flags",
+  "//buildconfig/config/node:node_ld_flags"
+]
+
+set_defaults("shared_library") {
+  configs = default_compiler_configs
+  output_extension = "node"
+}
+
+set_default_toolchain("//buildconfig/toolchain/$host_os:$host_os")

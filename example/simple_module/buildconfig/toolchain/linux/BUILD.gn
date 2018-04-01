@@ -1,0 +1,72 @@
+toolchain("linux") {
+  object_subdir = "{{target_out_dir}}/{{label_name}}"
+
+  cc = "gcc"
+  cxx = "g++"
+  ar = "ar"
+  ld = cxx
+  readelf = "readelf"
+  nm = "nm"
+
+  tool("cc") {
+    depfile = "{{output}}.d"
+    command = "$cc -MMD -MF $depfile {{defines}} {{include_dirs}} {{cflags}} {{cflags_c}} -c {{source}} -o {{output}}"
+    depsformat = "gcc"
+    description = "CC {{output}}"
+    outputs = [
+      "$object_subdir/{{source_name_part}}.o"
+    ]
+  }
+
+  tool("cxx") {
+    depfile = "{{output}}.d"
+    command = "$cxx -MMD -MF $depfile {{defines}} {{include_dirs}} {{cflags_c}} {{cflags_cc}} -c {{source}} -o {{output}}"
+    depsformat = "gcc"
+    description = "CC {{output}}"
+    outputs = [
+      "$object_subdir/{{source_name_part}}.o"
+    ]
+  }
+
+  tool("alink") {
+    command = "rm -f {{output}} && $ar rcs {{output}} {{inputs}}"
+    description = "AR {{output}}"
+    outputs = [
+      "{{target_out_dir}}/{{target_output_name}}{{output_extension}}",
+    ]
+    default_output_extension = ".a"
+    output_prefix = "lib"
+  }
+
+  tool("link") {
+    outputs = [
+      "{{root_out_dir}}/{{target_output_name}}{{output_extension}}",
+    ]
+    command = "$ld {{ldflags}} -o {{output}} {{inputs}} {{solibs}} {{libs}}"
+    description = "LINK {{output}}"
+  }
+
+  tool("solink") {
+    soname = "{{target_output_name}}{{output_extension}}"
+    sofile = "{{root_out_dir}}/$soname"
+    rspfile = sofile + ".rsp"
+    tocfile = sofile + ".TOC"
+
+    link_command = "$ld -shared {{ldflags}} -o \"$sofile\" -Wl,-soname=\"$soname\" @\"$rspfile\""
+    rspfile_content = "-Wl,--whole-archive {{inputs}} {{solibs}} -Wl,--no-whole-archive {{libs}}"
+    solink_wrapper = rebase_path("//buildconfig/toolchain/linux/gcc_solink_wrapper.py")
+    command = "$solink_wrapper --readelf=\"$readelf\" --nm=\"$nm\" --sofile=\"$sofile\" --tocfile=\"$tocfile\" --output=\"$sofile\" -- $link_command"
+    description = "LINK {{output}}"
+
+    default_output_extension = ".so"
+    default_output_dir = "{{root_out_dir}}"
+    output_prefix = "lib"
+    restat = true
+    outputs = [
+      sofile,
+      tocfile,
+    ]
+    link_output = sofile
+    depend_output = tocfile
+  }
+}
