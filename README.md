@@ -8,11 +8,12 @@ using `node-gn` as the native addon build tool is the right choice.
 
 How to Install
 -----------------
-To install `node-gn`, simplly run:
+The npm pakcage in npm.js is [`gn-node`](https://www.npmjs.com/package/gn-node), to install `node-gn`, you should run:
 ```
 npm install -g gn-node
 ```
-`node-gn` already contains builtin GN binary `gn` and Ninja binary `ninja`.
+`node-gn` already contains builtin GN binary `gn` and Ninja binary `ninja`, so you don't have to
+install GN and Ninja additionally.
 
 Usage
 --------------
