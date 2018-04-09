@@ -3,8 +3,8 @@ node-gn
 ### Node.js native addon build tool with GN/Ninja.
 `node-gn` is a Node.js native addon build tool using GN/Ninja, compared to
 [`node-gyp`](https://github.com/nodejs/node-gyp) which uses [gyp](https://gyp.gsrc.io/)  as the native addon meta-build system.
-Because the v8 project has already swithed to [GN](https://chromium.googlesource.com/chromium/src/tools/gn/) build system since version 6.6 ([related link]('https://v8project.blogspot.com/2018/03/v8-release-66.html')),
-using `node-gn` as the native addon build tool is the right choice.
+Because the v8 project has already swithed to [GN](https://chromium.googlesource.com/chromium/src/tools/gn/) build system since version 6.6 [related link]('https://v8project.blogspot.com/2018/03/v8-release-66.html'),
+using `node-gn` as the native addon build tool is a supplement to the `node-gyp` tool.
 
 How to Install
 -----------------
