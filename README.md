@@ -44,6 +44,10 @@ To build your project, run:
 gn-node build
 ```
 
+Sample
+--------------
+The ['example'](example) directory contians sample projects that using `node-gn` ad the build tool.
+
 
 License
 -----------------
