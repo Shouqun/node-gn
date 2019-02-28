@@ -37,11 +37,19 @@ To generate Ninja build files, run:
 ```
 gn-node gen
 ```
+Or if your want to generate Ninja build files to a specified directory, for example: out/Release
+```
+gn-node gen out/Release
+```
 
 ### Build your project
 To build your project, run:
 ```
 gn-node build
+```
+If your were generate Ninja build file to a specified directory, you should run:
+```
+gn-node build out/Release
 ```
 
 Sample
